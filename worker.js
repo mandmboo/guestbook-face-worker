@@ -267,10 +267,14 @@ async function runCycle() {
       await processPhoto(photo);
     } catch (error) {
       console.error(`[Worker] Failed photo ${photo.id}:`, error);
+
       try {
         await markFailed(photo.id, error?.message || String(error));
       } catch (markError) {
-        console.error(`[Worker] Failed to mark photo ${photo.id} as failed:`, markError);
+        console.error(
+          `[Worker] Failed to mark photo ${photo.id} as failed:`,
+          markError
+        );
       }
     }
   }
@@ -281,6 +285,7 @@ async function sleep(ms) {
 }
 
 async function main() {
+  console.log("[Worker] VERSION 2 DEBUG BUILD");
   console.log("[Worker] Starting face processing worker");
 
   while (true) {
