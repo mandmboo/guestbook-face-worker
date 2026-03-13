@@ -24,9 +24,9 @@ const BATCH_SIZE = 3;
 const LOAD_IMAGE_TIMEOUT_MS = 20000;
 const FACE_DETECTION_TIMEOUT_MS = 45000;
 const DB_TIMEOUT_MS = 10000;
-const MIN_FACE_WIDTH = 40;
-const MIN_FACE_HEIGHT = 40;
-const MIN_CONFIDENCE = 0.6;
+const MIN_FACE_WIDTH = 90;
+const MIN_FACE_HEIGHT = 90;
+const MIN_CONFIDENCE = 0.75;
 
 let modelsLoaded = false;
 
