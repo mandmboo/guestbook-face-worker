@@ -6,10 +6,12 @@
   "scripts": {
     "start": "node worker.js"
   },
+  "engines": {
+    "node": "20.x"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",
     "canvas": "^2.11.2",
-    "face-api.js": "^0.22.2",
-    "node-fetch": "^3.3.2"
+    "face-api.js": "^0.22.2"
   }
 }
