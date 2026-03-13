@@ -1,0 +1,15 @@
+{
+  "name": "guestbook-face-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "canvas": "^2.11.2",
+    "face-api.js": "^0.22.2",
+    "node-fetch": "^3.3.2"
+  }
+}
