@@ -49,6 +49,7 @@ async function withTimeout(promise, ms, label) {
 async function loadModels() {
   if (modelsLoaded) return;
 
+  console.log("[Worker] VERSION 3 REALLY NEW BUILD");
   console.log("[Worker] Loading face-api models...");
 
   await Promise.all([
@@ -170,9 +171,7 @@ async function saveDescriptors(eventId, photoId, faces) {
   }));
 
   const { error } = await withTimeout(
-    supabase
-      .from("photo_face_descriptors")
-      .insert(rows),
+    supabase.from("photo_face_descriptors").insert(rows),
     DB_TIMEOUT_MS,
     "saveDescriptors"
   );
@@ -260,7 +259,7 @@ async function runCycle() {
     return;
   }
 
-  console.log(`[Worker] Found ${pending.length} pending photo(s)`);
+  console.log(`[Worker] VERSION 3 found ${pending.length} pending photo(s)`);
 
   for (const photo of pending) {
     try {
@@ -285,7 +284,7 @@ async function sleep(ms) {
 }
 
 async function main() {
-  console.log("[Worker] VERSION 2 DEBUG BUILD");
+  console.log("[Worker] VERSION 3 REALLY NEW BUILD");
   console.log("[Worker] Starting face processing worker");
 
   while (true) {
