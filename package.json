@@ -12,6 +12,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",
     "canvas": "^2.11.2",
-    "face-api.js": "^0.22.2"
+    "face-api.js": "^0.22.2",
+    "sharp": "^0.33.5"
   }
 }
