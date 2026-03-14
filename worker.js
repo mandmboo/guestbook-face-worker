@@ -1,6 +1,7 @@
 import * as faceapi from "face-api.js";
 import { Canvas, Image, ImageData, loadImage } from "canvas";
 import { createClient } from "@supabase/supabase-js";
+import sharp from "sharp";
 
 faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
 
@@ -83,42 +84,51 @@ async function fetchImageBuffer(url) {
   }
 }
 
-function createResizedCanvas(img) {
-  const width = img.width || 0;
-  const height = img.height || 0;
+async function normaliseImageBuffer(buffer) {
+  try {
+    const transformer = sharp(buffer, { failOn: "none" }).rotate();
 
-  if (!width || !height) {
-    throw new Error("Image dimensions were invalid");
+    const metadata = await transformer.metadata();
+
+    if (!metadata.width || !metadata.height) {
+      throw new Error("Could not read image dimensions");
+    }
+
+    const largestSide = Math.max(metadata.width, metadata.height);
+    const shouldResize = largestSide > MAX_IMAGE_DIMENSION;
+
+    let pipeline = sharp(buffer, { failOn: "none" }).rotate();
+
+    if (shouldResize) {
+      pipeline = pipeline.resize({
+        width: MAX_IMAGE_DIMENSION,
+        height: MAX_IMAGE_DIMENSION,
+        fit: "inside",
+        withoutEnlargement: true,
+      });
+    }
+
+    const pngBuffer = await pipeline.png().toBuffer();
+    const outputMeta = await sharp(pngBuffer).metadata();
+
+    console.log(
+      `[Worker] Normalised image ${metadata.width}x${metadata.height} -> ${outputMeta.width}x${outputMeta.height}`
+    );
+
+    return {
+      buffer: pngBuffer,
+      width: outputMeta.width || metadata.width,
+      height: outputMeta.height || metadata.height,
+    };
+  } catch (error) {
+    throw new Error(`Sharp normalisation failed: ${error?.message || String(error)}`);
   }
-
-  const largestSide = Math.max(width, height);
-
-  if (largestSide <= MAX_IMAGE_DIMENSION) {
-    const canvas = new Canvas(width, height);
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(img, 0, 0, width, height);
-    return canvas;
-  }
-
-  const scale = MAX_IMAGE_DIMENSION / largestSide;
-  const targetWidth = Math.max(1, Math.round(width * scale));
-  const targetHeight = Math.max(1, Math.round(height * scale));
-
-  const canvas = new Canvas(targetWidth, targetHeight);
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
-
-  console.log(
-    `[Worker] Resized image from ${width}x${height} to ${targetWidth}x${targetHeight}`
-  );
-
-  return canvas;
 }
 
 async function loadModels() {
   if (modelsLoaded) return;
 
-  console.log("[Worker] VERSION 6 REMOVE CONTENT-TYPE BLOCK");
+  console.log("[Worker] VERSION 7 SHARP NORMALISATION");
   console.log("[Worker] Loading face-api models...");
 
   await Promise.all([
@@ -261,20 +271,28 @@ async function detectFacesFromUrl(imageUrl) {
     `[Worker] Image downloaded (${buffer.length} bytes, ${contentType || "unknown content type"})`
   );
 
+  const normalised = await withTimeout(
+    normaliseImageBuffer(buffer),
+    LOAD_IMAGE_TIMEOUT_MS + 10000,
+    "normaliseImageBuffer"
+  );
+
   let img;
 
   try {
-    img = await withTimeout(loadImage(buffer), LOAD_IMAGE_TIMEOUT_MS, "loadImage");
+    img = await withTimeout(
+      loadImage(normalised.buffer),
+      LOAD_IMAGE_TIMEOUT_MS,
+      "loadImage"
+    );
   } catch (error) {
-    throw new Error(`Image decode failed: ${error?.message || String(error)}`);
+    throw new Error(`Image decode failed after normalisation: ${error?.message || String(error)}`);
   }
 
   console.log(`[Worker] Image loaded: ${img.width}x${img.height}`);
 
-  const inputCanvas = createResizedCanvas(img);
-
   const basicDetections = await withTimeout(
-    faceapi.detectAllFaces(inputCanvas),
+    faceapi.detectAllFaces(img),
     FACE_DETECTION_TIMEOUT_MS,
     "basic face detection"
   );
@@ -287,7 +305,7 @@ async function detectFacesFromUrl(imageUrl) {
 
   const detections = await withTimeout(
     faceapi
-      .detectAllFaces(inputCanvas)
+      .detectAllFaces(img)
       .withFaceLandmarks()
       .withFaceDescriptors(),
     FACE_DETECTION_TIMEOUT_MS,
@@ -296,22 +314,19 @@ async function detectFacesFromUrl(imageUrl) {
 
   console.log(`[Worker] Raw detections found: ${detections.length}`);
 
-  const scaleX = (img.width || 1) / (inputCanvas.width || 1);
-  const scaleY = (img.height || 1) / (inputCanvas.height || 1);
-
   const faces = detections
     .map((detection, index) => ({
       face_index: index,
       descriptor: Array.from(detection.descriptor),
       bounding_box: {
-        x: detection.detection.box.x * scaleX,
-        y: detection.detection.box.y * scaleY,
-        width: detection.detection.box.width * scaleX,
-        height: detection.detection.box.height * scaleY,
+        x: detection.detection.box.x,
+        y: detection.detection.box.y,
+        width: detection.detection.box.width,
+        height: detection.detection.box.height,
       },
       confidence: detection.detection.score,
-      face_width: Math.round(detection.detection.box.width * scaleX),
-      face_height: Math.round(detection.detection.box.height * scaleY),
+      face_width: Math.round(detection.detection.box.width),
+      face_height: Math.round(detection.detection.box.height),
     }))
     .filter(
       (face) =>
@@ -374,7 +389,7 @@ async function runCycle() {
     return;
   }
 
-  console.log(`[Worker] VERSION 6 found ${pending.length} pending photo(s)`);
+  console.log(`[Worker] VERSION 7 found ${pending.length} pending photo(s)`);
 
   await Promise.all(pending.map((photo) => processPhotoSafely(photo)));
 }
@@ -384,7 +399,7 @@ async function sleep(ms) {
 }
 
 async function main() {
-  console.log("[Worker] VERSION 6 REMOVE CONTENT-TYPE BLOCK");
+  console.log("[Worker] VERSION 7 SHARP NORMALISATION");
   console.log("[Worker] Starting face processing worker");
 
   while (true) {
