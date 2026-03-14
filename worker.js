@@ -24,6 +24,7 @@ const BATCH_SIZE = 3;
 const LOAD_IMAGE_TIMEOUT_MS = 20000;
 const FACE_DETECTION_TIMEOUT_MS = 45000;
 const DB_TIMEOUT_MS = 10000;
+const IMAGE_DOWNLOAD_TIMEOUT_MS = 25000;
 const MIN_FACE_WIDTH = 90;
 const MIN_FACE_HEIGHT = 90;
 const MIN_CONFIDENCE = 0.75;
@@ -46,16 +47,61 @@ async function withTimeout(promise, ms, label) {
   }
 }
 
+async function fetchImageBuffer(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), IMAGE_DOWNLOAD_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to download image: ${response.status}`);
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+
+    if (
+      !contentType.includes("jpeg") &&
+      !contentType.includes("jpg") &&
+      !contentType.includes("png") &&
+      !contentType.includes("webp")
+    ) {
+      throw new Error(`Unsupported image type: ${contentType || "unknown"}`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    if (!buffer.length) {
+      throw new Error("Downloaded image buffer was empty");
+    }
+
+    return {
+      buffer,
+      contentType,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function loadModels() {
   if (modelsLoaded) return;
 
-  console.log("[Worker] VERSION 3 REALLY NEW BUILD");
+  console.log("[Worker] VERSION 5 PARALLEL + TWO STEP DETECTION");
   console.log("[Worker] Loading face-api models...");
 
   await Promise.all([
     faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
     faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
-    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
   ]);
 
   modelsLoaded = true;
@@ -90,7 +136,7 @@ async function markProcessing(photoId) {
       .from("event_photos")
       .update({
         processing_status: "processing",
-        processing_error: null
+        processing_error: null,
       })
       .eq("id", photoId),
     DB_TIMEOUT_MS,
@@ -110,7 +156,7 @@ async function markComplete(photoId, faceCount) {
         processing_status: "complete",
         face_count: faceCount,
         processed_at: new Date().toISOString(),
-        processing_error: null
+        processing_error: null,
       })
       .eq("id", photoId),
     DB_TIMEOUT_MS,
@@ -128,7 +174,7 @@ async function markFailed(photoId, message) {
       .from("event_photos")
       .update({
         processing_status: "failed",
-        processing_error: String(message || "Unknown error").slice(0, 1000)
+        processing_error: String(message || "Unknown error").slice(0, 1000),
       })
       .eq("id", photoId),
     DB_TIMEOUT_MS,
@@ -167,7 +213,7 @@ async function saveDescriptors(eventId, photoId, faces) {
     bounding_box: face.bounding_box,
     confidence: face.confidence,
     face_width: face.face_width,
-    face_height: face.face_height
+    face_height: face.face_height,
   }));
 
   const { error } = await withTimeout(
@@ -180,15 +226,37 @@ async function saveDescriptors(eventId, photoId, faces) {
 }
 
 async function detectFacesFromUrl(imageUrl) {
-  console.log(`[Worker] Loading image: ${imageUrl}`);
+  console.log(`[Worker] Downloading image: ${imageUrl}`);
+
+  const { buffer, contentType } = await withTimeout(
+    fetchImageBuffer(imageUrl),
+    IMAGE_DOWNLOAD_TIMEOUT_MS + 5000,
+    "fetchImageBuffer"
+  );
+
+  console.log(
+    `[Worker] Image downloaded (${buffer.length} bytes, ${contentType || "unknown content type"})`
+  );
 
   const img = await withTimeout(
-    loadImage(imageUrl),
+    loadImage(buffer),
     LOAD_IMAGE_TIMEOUT_MS,
     "loadImage"
   );
 
   console.log(`[Worker] Image loaded: ${img.width}x${img.height}`);
+
+  const basicDetections = await withTimeout(
+    faceapi.detectAllFaces(img),
+    FACE_DETECTION_TIMEOUT_MS,
+    "basic face detection"
+  );
+
+  console.log(`[Worker] Basic detections found: ${basicDetections.length}`);
+
+  if (!basicDetections.length) {
+    return [];
+  }
 
   const detections = await withTimeout(
     faceapi
@@ -196,7 +264,7 @@ async function detectFacesFromUrl(imageUrl) {
       .withFaceLandmarks()
       .withFaceDescriptors(),
     FACE_DETECTION_TIMEOUT_MS,
-    "face detection"
+    "face descriptor extraction"
   );
 
   console.log(`[Worker] Raw detections found: ${detections.length}`);
@@ -209,11 +277,11 @@ async function detectFacesFromUrl(imageUrl) {
         x: detection.detection.box.x,
         y: detection.detection.box.y,
         width: detection.detection.box.width,
-        height: detection.detection.box.height
+        height: detection.detection.box.height,
       },
       confidence: detection.detection.score,
       face_width: Math.round(detection.detection.box.width),
-      face_height: Math.round(detection.detection.box.height)
+      face_height: Math.round(detection.detection.box.height),
     }))
     .filter(
       (face) =>
@@ -249,6 +317,23 @@ async function processPhoto(photo) {
   console.log(`[Worker] Marked complete ${photo.id} with ${faces.length} face(s)`);
 }
 
+async function processPhotoSafely(photo) {
+  try {
+    await processPhoto(photo);
+  } catch (error) {
+    console.error(`[Worker] Failed photo ${photo.id}:`, error);
+
+    try {
+      await markFailed(photo.id, error?.message || String(error));
+    } catch (markError) {
+      console.error(
+        `[Worker] Failed to mark photo ${photo.id} as failed:`,
+        markError
+      );
+    }
+  }
+}
+
 async function runCycle() {
   await loadModels();
 
@@ -259,24 +344,9 @@ async function runCycle() {
     return;
   }
 
-  console.log(`[Worker] VERSION 3 found ${pending.length} pending photo(s)`);
+  console.log(`[Worker] VERSION 5 found ${pending.length} pending photo(s)`);
 
-  for (const photo of pending) {
-    try {
-      await processPhoto(photo);
-    } catch (error) {
-      console.error(`[Worker] Failed photo ${photo.id}:`, error);
-
-      try {
-        await markFailed(photo.id, error?.message || String(error));
-      } catch (markError) {
-        console.error(
-          `[Worker] Failed to mark photo ${photo.id} as failed:`,
-          markError
-        );
-      }
-    }
-  }
+  await Promise.all(pending.map((photo) => processPhotoSafely(photo)));
 }
 
 async function sleep(ms) {
@@ -284,7 +354,7 @@ async function sleep(ms) {
 }
 
 async function main() {
-  console.log("[Worker] VERSION 3 REALLY NEW BUILD");
+  console.log("[Worker] VERSION 5 PARALLEL + TWO STEP DETECTION");
   console.log("[Worker] Starting face processing worker");
 
   while (true) {
