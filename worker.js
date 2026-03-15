@@ -21,15 +21,16 @@ if (!SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const POLL_INTERVAL_MS = 5000;
-const BATCH_SIZE = 3;
-const LOAD_IMAGE_TIMEOUT_MS = 20000;
-const FACE_DETECTION_TIMEOUT_MS = 45000;
-const DB_TIMEOUT_MS = 10000;
-const IMAGE_DOWNLOAD_TIMEOUT_MS = 25000;
+const BATCH_SIZE = 2;
+const LOAD_IMAGE_TIMEOUT_MS = 45000;
+const FACE_DETECTION_TIMEOUT_MS = 60000;
+const DB_TIMEOUT_MS = 20000;
+const IMAGE_DOWNLOAD_TIMEOUT_MS = 45000;
+const NORMALISE_TIMEOUT_MS = 90000;
 const MIN_FACE_WIDTH = 90;
 const MIN_FACE_HEIGHT = 90;
 const MIN_CONFIDENCE = 0.75;
-const MAX_IMAGE_DIMENSION = 1600;
+const MAX_IMAGE_DIMENSION = 1280;
 
 let modelsLoaded = false;
 
@@ -86,29 +87,26 @@ async function fetchImageBuffer(url) {
 
 async function normaliseImageBuffer(buffer) {
   try {
-    const transformer = sharp(buffer, { failOn: "none" }).rotate();
-
-    const metadata = await transformer.metadata();
+    const metadata = await sharp(buffer, { failOn: "none" })
+      .rotate()
+      .metadata();
 
     if (!metadata.width || !metadata.height) {
       throw new Error("Could not read image dimensions");
     }
 
-    const largestSide = Math.max(metadata.width, metadata.height);
-    const shouldResize = largestSide > MAX_IMAGE_DIMENSION;
-
-    let pipeline = sharp(buffer, { failOn: "none" }).rotate();
-
-    if (shouldResize) {
-      pipeline = pipeline.resize({
+    const pipeline = sharp(buffer, { failOn: "none", limitInputPixels: false })
+      .rotate()
+      .resize({
         width: MAX_IMAGE_DIMENSION,
         height: MAX_IMAGE_DIMENSION,
         fit: "inside",
         withoutEnlargement: true,
-      });
-    }
+        fastShrinkOnLoad: true,
+      })
+      .png({ compressionLevel: 6 });
 
-    const pngBuffer = await pipeline.png().toBuffer();
+    const pngBuffer = await pipeline.toBuffer();
     const outputMeta = await sharp(pngBuffer).metadata();
 
     console.log(
@@ -128,7 +126,7 @@ async function normaliseImageBuffer(buffer) {
 async function loadModels() {
   if (modelsLoaded) return;
 
-  console.log("[Worker] VERSION 7 SHARP NORMALISATION");
+  console.log("[Worker] VERSION 8 TIMEOUT TUNING");
   console.log("[Worker] Loading face-api models...");
 
   await Promise.all([
@@ -162,8 +160,6 @@ async function getPendingPhotos() {
 }
 
 async function markProcessing(photoId) {
-  console.log(`[Worker] About to mark processing ${photoId}`);
-
   const { error } = await withTimeout(
     supabase
       .from("event_photos")
@@ -180,8 +176,6 @@ async function markProcessing(photoId) {
 }
 
 async function markComplete(photoId, faceCount) {
-  console.log(`[Worker] About to mark complete ${photoId}`);
-
   const { error } = await withTimeout(
     supabase
       .from("event_photos")
@@ -200,8 +194,6 @@ async function markComplete(photoId, faceCount) {
 }
 
 async function markFailed(photoId, message) {
-  console.log(`[Worker] About to mark failed ${photoId}: ${message}`);
-
   const { error } = await withTimeout(
     supabase
       .from("event_photos")
@@ -218,8 +210,6 @@ async function markFailed(photoId, message) {
 }
 
 async function clearExistingDescriptors(photoId) {
-  console.log(`[Worker] About to clear descriptors ${photoId}`);
-
   const { error } = await withTimeout(
     supabase
       .from("photo_face_descriptors")
@@ -273,7 +263,7 @@ async function detectFacesFromUrl(imageUrl) {
 
   const normalised = await withTimeout(
     normaliseImageBuffer(buffer),
-    LOAD_IMAGE_TIMEOUT_MS + 10000,
+    NORMALISE_TIMEOUT_MS,
     "normaliseImageBuffer"
   );
 
@@ -348,17 +338,13 @@ async function processPhoto(photo) {
   console.log(`[Worker] Processing photo ${photo.id}`);
 
   await markProcessing(photo.id);
-  console.log(`[Worker] Marked processing ${photo.id}`);
-
   await clearExistingDescriptors(photo.id);
-  console.log(`[Worker] Cleared old descriptors ${photo.id}`);
 
   const faces = await detectFacesFromUrl(photo.storage_url);
 
   await saveDescriptors(photo.event_id, photo.id, faces);
-  console.log(`[Worker] Saved ${faces.length} descriptor row(s) for ${photo.id}`);
-
   await markComplete(photo.id, faces.length);
+
   console.log(`[Worker] Marked complete ${photo.id} with ${faces.length} face(s)`);
 }
 
@@ -389,7 +375,7 @@ async function runCycle() {
     return;
   }
 
-  console.log(`[Worker] VERSION 7 found ${pending.length} pending photo(s)`);
+  console.log(`[Worker] VERSION 8 found ${pending.length} pending photo(s)`);
 
   await Promise.all(pending.map((photo) => processPhotoSafely(photo)));
 }
@@ -399,7 +385,7 @@ async function sleep(ms) {
 }
 
 async function main() {
-  console.log("[Worker] VERSION 7 SHARP NORMALISATION");
+  console.log("[Worker] VERSION 8 TIMEOUT TUNING");
   console.log("[Worker] Starting face processing worker");
 
   while (true) {
