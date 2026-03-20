@@ -21,10 +21,10 @@ if (!SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const POLL_INTERVAL_MS = 5000;
-const BATCH_SIZE = 2;
+const BATCH_SIZE = 1;
 const LOAD_IMAGE_TIMEOUT_MS = 45000;
 const FACE_DETECTION_TIMEOUT_MS = 60000;
-const DB_TIMEOUT_MS = 20000;
+const DB_TIMEOUT_MS = 60000;
 const IMAGE_DOWNLOAD_TIMEOUT_MS = 45000;
 const NORMALISE_TIMEOUT_MS = 90000;
 const MIN_FACE_WIDTH = 90;
@@ -126,7 +126,7 @@ async function normaliseImageBuffer(buffer) {
 async function loadModels() {
   if (modelsLoaded) return;
 
-  console.log("[Worker] VERSION 8 TIMEOUT TUNING");
+  console.log("[Worker] VERSION 9 STABLE DB TIMEOUTS");
   console.log("[Worker] Loading face-api models...");
 
   await Promise.all([
@@ -146,7 +146,7 @@ async function getPendingPhotos() {
     supabase
       .from("event_photos")
       .select("id, event_id, storage_url, processing_status")
-      .eq("processing_status", "pending")
+      .in("processing_status", ["pending", "failed"])
       .not("storage_url", "is", null)
       .order("created_at", { ascending: true })
       .limit(BATCH_SIZE),
@@ -357,10 +357,7 @@ async function processPhotoSafely(photo) {
     try {
       await markFailed(photo.id, error?.message || String(error));
     } catch (markError) {
-      console.error(
-        `[Worker] Failed to mark photo ${photo.id} as failed:`,
-        markError
-      );
+      console.error(`[Worker] Failed to mark photo ${photo.id} as failed:`, markError);
     }
   }
 }
@@ -375,9 +372,11 @@ async function runCycle() {
     return;
   }
 
-  console.log(`[Worker] VERSION 8 found ${pending.length} pending photo(s)`);
+  console.log(`[Worker] VERSION 9 found ${pending.length} pending photo(s)`);
 
-  await Promise.all(pending.map((photo) => processPhotoSafely(photo)));
+  for (const photo of pending) {
+    await processPhotoSafely(photo);
+  }
 }
 
 async function sleep(ms) {
@@ -385,7 +384,7 @@ async function sleep(ms) {
 }
 
 async function main() {
-  console.log("[Worker] VERSION 8 TIMEOUT TUNING");
+  console.log("[Worker] VERSION 9 STABLE DB TIMEOUTS");
   console.log("[Worker] Starting face processing worker");
 
   while (true) {
