@@ -31,6 +31,7 @@ const MIN_FACE_WIDTH = 90;
 const MIN_FACE_HEIGHT = 90;
 const MIN_CONFIDENCE = 0.75;
 const MAX_IMAGE_DIMENSION = 1280;
+const PROCESSED_BUCKET = "processed-photos";
 
 let modelsLoaded = false;
 
@@ -104,19 +105,23 @@ async function normaliseImageBuffer(buffer) {
         withoutEnlargement: true,
         fastShrinkOnLoad: true,
       })
-      .png({ compressionLevel: 6 });
+      .jpeg({
+        quality: 88,
+        mozjpeg: true,
+      });
 
-    const pngBuffer = await pipeline.toBuffer();
-    const outputMeta = await sharp(pngBuffer).metadata();
+    const jpgBuffer = await pipeline.toBuffer();
+    const outputMeta = await sharp(jpgBuffer).metadata();
 
     console.log(
       `[Worker] Normalised image ${metadata.width}x${metadata.height} -> ${outputMeta.width}x${outputMeta.height}`
     );
 
     return {
-      buffer: pngBuffer,
+      buffer: jpgBuffer,
       width: outputMeta.width || metadata.width,
       height: outputMeta.height || metadata.height,
+      contentType: "image/jpeg",
     };
   } catch (error) {
     throw new Error(`Sharp normalisation failed: ${error?.message || String(error)}`);
@@ -126,7 +131,7 @@ async function normaliseImageBuffer(buffer) {
 async function loadModels() {
   if (modelsLoaded) return;
 
-  console.log("[Worker] VERSION 9 STABLE DB TIMEOUTS");
+  console.log("[Worker] VERSION 10 PROCESSED IMAGE UPLOADS");
   console.log("[Worker] Loading face-api models...");
 
   await Promise.all([
@@ -222,6 +227,19 @@ async function clearExistingDescriptors(photoId) {
   if (error) throw error;
 }
 
+async function clearExistingProcessedPhoto(photoId) {
+  const { error } = await withTimeout(
+    supabase
+      .from("processed_event_photos")
+      .delete()
+      .eq("event_photo_id", photoId),
+    DB_TIMEOUT_MS,
+    "clearExistingProcessedPhoto"
+  );
+
+  if (error) throw error;
+}
+
 async function saveDescriptors(eventId, photoId, faces) {
   if (!faces.length) {
     console.log(`[Worker] No descriptors to save for ${photoId}`);
@@ -248,30 +266,69 @@ async function saveDescriptors(eventId, photoId, faces) {
   if (error) throw error;
 }
 
-async function detectFacesFromUrl(imageUrl) {
-  console.log(`[Worker] Downloading image: ${imageUrl}`);
+async function saveProcessedImage(eventId, photoId, buffer) {
+  const path = `events/${eventId}/processed/${photoId}.jpg`;
 
-  const { buffer, contentType } = await withTimeout(
-    fetchImageBuffer(imageUrl),
-    IMAGE_DOWNLOAD_TIMEOUT_MS + 5000,
-    "fetchImageBuffer"
+  const { error: uploadError } = await withTimeout(
+    supabase.storage
+      .from(PROCESSED_BUCKET)
+      .upload(path, buffer, {
+        contentType: "image/jpeg",
+        upsert: true,
+      }),
+    DB_TIMEOUT_MS,
+    "saveProcessedImage upload"
   );
 
-  console.log(
-    `[Worker] Image downloaded (${buffer.length} bytes, ${contentType || "unknown content type"})`
+  if (uploadError) throw uploadError;
+
+  const { data: publicUrlData } = supabase.storage
+    .from(PROCESSED_BUCKET)
+    .getPublicUrl(path);
+
+  const processedUrl = publicUrlData?.publicUrl;
+
+  if (!processedUrl) {
+    throw new Error("Failed to get processed image public URL");
+  }
+
+  const row = {
+    event_id: eventId,
+    event_photo_id: photoId,
+    processed_url: processedUrl,
+    storage_path: path,
+    bucket_name: PROCESSED_BUCKET,
+    created_at: new Date().toISOString(),
+  };
+
+  const { error: dbError } = await withTimeout(
+    supabase
+      .from("processed_event_photos")
+      .upsert(row, {
+        onConflict: "event_photo_id",
+      }),
+    DB_TIMEOUT_MS,
+    "saveProcessedImage upsert"
   );
 
-  const normalised = await withTimeout(
-    normaliseImageBuffer(buffer),
-    NORMALISE_TIMEOUT_MS,
-    "normaliseImageBuffer"
-  );
+  if (dbError) {
+    throw dbError;
+  }
 
+  console.log(`[Worker] Saved processed image for ${photoId}: ${processedUrl}`);
+
+  return {
+    processedUrl,
+    path,
+  };
+}
+
+async function detectFacesFromBuffer(imageBuffer) {
   let img;
 
   try {
     img = await withTimeout(
-      loadImage(normalised.buffer),
+      loadImage(imageBuffer),
       LOAD_IMAGE_TIMEOUT_MS,
       "loadImage"
     );
@@ -330,6 +387,28 @@ async function detectFacesFromUrl(imageUrl) {
   return faces;
 }
 
+async function prepareImageForProcessing(imageUrl) {
+  console.log(`[Worker] Downloading image: ${imageUrl}`);
+
+  const { buffer, contentType } = await withTimeout(
+    fetchImageBuffer(imageUrl),
+    IMAGE_DOWNLOAD_TIMEOUT_MS + 5000,
+    "fetchImageBuffer"
+  );
+
+  console.log(
+    `[Worker] Image downloaded (${buffer.length} bytes, ${contentType || "unknown content type"})`
+  );
+
+  const normalised = await withTimeout(
+    normaliseImageBuffer(buffer),
+    NORMALISE_TIMEOUT_MS,
+    "normaliseImageBuffer"
+  );
+
+  return normalised;
+}
+
 async function processPhoto(photo) {
   if (!photo.storage_url) {
     throw new Error(`Photo ${photo.id} has no storage_url`);
@@ -339,8 +418,13 @@ async function processPhoto(photo) {
 
   await markProcessing(photo.id);
   await clearExistingDescriptors(photo.id);
+  await clearExistingProcessedPhoto(photo.id);
 
-  const faces = await detectFacesFromUrl(photo.storage_url);
+  const normalised = await prepareImageForProcessing(photo.storage_url);
+
+  await saveProcessedImage(photo.event_id, photo.id, normalised.buffer);
+
+  const faces = await detectFacesFromBuffer(normalised.buffer);
 
   await saveDescriptors(photo.event_id, photo.id, faces);
   await markComplete(photo.id, faces.length);
@@ -372,7 +456,7 @@ async function runCycle() {
     return;
   }
 
-  console.log(`[Worker] VERSION 9 found ${pending.length} pending photo(s)`);
+  console.log(`[Worker] VERSION 10 found ${pending.length} pending photo(s)`);
 
   for (const photo of pending) {
     await processPhotoSafely(photo);
@@ -384,7 +468,7 @@ async function sleep(ms) {
 }
 
 async function main() {
-  console.log("[Worker] VERSION 9 STABLE DB TIMEOUTS");
+  console.log("[Worker] VERSION 10 PROCESSED IMAGE UPLOADS");
   console.log("[Worker] Starting face processing worker");
 
   while (true) {
