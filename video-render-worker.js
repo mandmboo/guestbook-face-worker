@@ -17,25 +17,16 @@ const DOWNLOAD_TIMEOUT_MS = Number(process.env.RENDER_DOWNLOAD_TIMEOUT_MS || 900
 const JOB_RETENTION_MS = Number(process.env.RENDER_JOB_RETENTION_MS || 24 * 60 * 60 * 1000);
 const MAX_CONCURRENT_RENDERS = Number(process.env.MAX_CONCURRENT_RENDERS || 1);
 
-if (!RENDER_SECRET) {
-  console.warn("[VideoRender] RENDER_SECRET is not set. Render endpoints will reject requests.");
-}
+if (!RENDER_SECRET) console.warn("[VideoRender] RENDER_SECRET is not set. Render endpoints will reject requests.");
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) console.warn("[VideoRender] Supabase output upload variables are missing.");
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn("[VideoRender] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing. Uploads will fail until configured.");
-}
-
-const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-  : null;
-
+const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) : null;
 const jobs = new Map();
 const queue = [];
 let activeRenders = 0;
 let bucketReady = false;
 
 function json(res, status, body) {
-  const payload = JSON.stringify(body);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
@@ -43,7 +34,7 @@ function json(res, status, body) {
     "access-control-allow-methods": "GET,POST,OPTIONS",
     "access-control-allow-headers": "content-type,x-render-secret,authorization",
   });
-  res.end(payload);
+  res.end(JSON.stringify(body));
 }
 
 function safeMessage(error) {
@@ -55,12 +46,8 @@ function nowIso() {
 }
 
 function updateJob(jobId, patch) {
-  const existing = jobs.get(jobId) || {};
-  const next = {
-    ...existing,
-    ...patch,
-    updatedAt: nowIso(),
-  };
+  const current = jobs.get(jobId) || {};
+  const next = { ...current, ...patch, updatedAt: nowIso() };
   jobs.set(jobId, next);
   return next;
 }
@@ -69,21 +56,16 @@ function cleanOldJobs() {
   const cutoff = Date.now() - JOB_RETENTION_MS;
   for (const [jobId, job] of jobs.entries()) {
     const updatedAt = Date.parse(job.updatedAt || job.createdAt || 0);
-    if (updatedAt && updatedAt < cutoff && ["complete", "failed"].includes(job.status)) {
-      jobs.delete(jobId);
-    }
+    if (updatedAt && updatedAt < cutoff && ["complete", "failed"].includes(job.status)) jobs.delete(jobId);
   }
 }
 
 function isAuthed(req) {
   const provided = req.headers["x-render-secret"] || req.headers.authorization?.replace(/^Bearer\s+/i, "");
   if (!RENDER_SECRET || !provided) return false;
-
   const providedBuffer = Buffer.from(String(provided));
   const secretBuffer = Buffer.from(RENDER_SECRET);
-
   if (providedBuffer.length !== secretBuffer.length) return false;
-
   return crypto.timingSafeEqual(providedBuffer, secretBuffer);
 }
 
@@ -91,16 +73,11 @@ async function readJsonBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const raw = Buffer.concat(chunks).toString("utf8");
-  if (!raw.trim()) return {};
-  return JSON.parse(raw);
+  return raw.trim() ? JSON.parse(raw) : {};
 }
 
 function slugify(value, fallback = "memory-film") {
-  return String(value || fallback)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 80) || fallback;
+  return String(value || fallback).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || fallback;
 }
 
 function inferExtension(url, contentType = "") {
@@ -117,9 +94,7 @@ function inferExtension(url, contentType = "") {
   try {
     const ext = path.extname(new URL(url).pathname).toLowerCase();
     if (ext) return ext.slice(0, 10);
-  } catch {
-    // ignore
-  }
+  } catch {}
   return ".bin";
 }
 
@@ -131,15 +106,13 @@ function inferMediaType(item, contentType = "") {
   if (type.startsWith("video/")) return "video";
   if (type.startsWith("image/")) return "image";
   const url = String(item.url || item.storage_url || item.src || "").toLowerCase();
-  if (/\.(mp4|mov|webm|m4v)(\?|#|$)/.test(url)) return "video";
-  return "image";
+  return /\.(mp4|mov|webm|m4v)(\?|#|$)/.test(url) ? "video" : "image";
 }
 
 async function run(command, args, options = {}) {
   const label = options.label || command;
   const timeoutMs = options.timeoutMs || 10 * 60 * 1000;
   console.log(`[VideoRender] ${label}: ${command} ${args.join(" ")}`);
-
   return await new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
@@ -148,77 +121,50 @@ async function run(command, args, options = {}) {
       child.kill("SIGKILL");
       reject(new Error(`${label} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-      stdout = stdout.slice(-12000);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-      stderr = stderr.slice(-20000);
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
+    child.stdout.on("data", (chunk) => { stdout = (stdout + chunk.toString()).slice(-12000); });
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-20000); });
+    child.on("error", (error) => { clearTimeout(timer); reject(error); });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (code === 0) {
-        resolve({ stdout, stderr });
-      } else {
-        reject(new Error(`${label} failed with code ${code}: ${stderr || stdout}`));
-      }
+      if (code === 0) resolve({ stdout, stderr });
+      else reject(new Error(`${label} failed with code ${code}: ${stderr || stdout}`));
     });
   });
+}
+
+async function hasAudioStream(inputPath) {
+  try {
+    const { stdout } = await run("ffprobe", ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", inputPath], { label: "probe audio", timeoutMs: 30000 });
+    return stdout.toLowerCase().includes("audio");
+  } catch (error) {
+    console.warn("[VideoRender] Could not probe audio stream:", safeMessage(error));
+    return false;
+  }
 }
 
 async function downloadToFile(url, destination) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
-
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: {
-        "user-agent": "MemoryLaneVideoRender/1.0",
-        accept: "image/*,video/*,audio/*,*/*;q=0.8",
-      },
+      headers: { "user-agent": "MemoryLaneVideoRender/1.0", accept: "image/*,video/*,audio/*,*/*;q=0.8" },
     });
-
-    if (!response.ok || !response.body) {
-      throw new Error(`Download failed ${response.status} for ${url}`);
-    }
-
+    if (!response.ok || !response.body) throw new Error(`Download failed ${response.status} for ${url}`);
     const length = Number(response.headers.get("content-length") || 0);
-    if (length && length > MAX_DOWNLOAD_BYTES) {
-      throw new Error(`Media file is too large (${length} bytes)`);
-    }
-
+    if (length && length > MAX_DOWNLOAD_BYTES) throw new Error(`Media file is too large (${length} bytes)`);
     let downloaded = 0;
     const writeStream = createWriteStream(destination);
     const reader = response.body.getReader();
-
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
       downloaded += value.byteLength;
-      if (downloaded > MAX_DOWNLOAD_BYTES) {
-        throw new Error(`Media file exceeded max download size (${MAX_DOWNLOAD_BYTES} bytes)`);
-      }
-      if (!writeStream.write(Buffer.from(value))) {
-        await new Promise((resolve) => writeStream.once("drain", resolve));
-      }
+      if (downloaded > MAX_DOWNLOAD_BYTES) throw new Error(`Media file exceeded max download size (${MAX_DOWNLOAD_BYTES} bytes)`);
+      if (!writeStream.write(Buffer.from(value))) await new Promise((resolve) => writeStream.once("drain", resolve));
     }
-
-    await new Promise((resolve, reject) => {
-      writeStream.end(resolve);
-      writeStream.on("error", reject);
-    });
-
-    return {
-      contentType: response.headers.get("content-type") || "",
-      bytes: downloaded,
-    };
+    await new Promise((resolve, reject) => { writeStream.end(resolve); writeStream.on("error", reject); });
+    return { contentType: response.headers.get("content-type") || "", bytes: downloaded };
   } finally {
     clearTimeout(timer);
   }
@@ -234,44 +180,41 @@ function dimensionsForPayload(payload) {
   const aspect = String(payload.aspectRatio || payload.aspect || "vertical").toLowerCase();
   const width = normaliseNumber(payload.width, aspect.includes("square") ? 1080 : aspect.includes("landscape") ? 1920 : 1080, 320, 3840);
   const height = normaliseNumber(payload.height, aspect.includes("square") ? 1080 : aspect.includes("landscape") ? 1080 : 1920, 320, 3840);
-  return {
-    width: width % 2 === 0 ? width : width + 1,
-    height: height % 2 === 0 ? height : height + 1,
-  };
+  return { width: width % 2 === 0 ? width : width + 1, height: height % 2 === 0 ? height : height + 1 };
 }
 
 function buildVideoFilter(width, height, fps, duration, fade = false) {
-  const base = [
-    `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
-    `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black`,
-    "setsar=1",
-    "format=yuv420p",
-  ];
-
+  const base = [`scale=${width}:${height}:force_original_aspect_ratio=decrease`, `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black`, "setsar=1", "format=yuv420p"];
   if (fade && duration >= 2) {
-    const fadeOutStart = Math.max(0, duration - 0.45).toFixed(2);
     base.push("fade=t=in:st=0:d=0.35");
-    base.push(`fade=t=out:st=${fadeOutStart}:d=0.35`);
+    base.push(`fade=t=out:st=${Math.max(0, duration - 0.45).toFixed(2)}:d=0.35`);
   }
-
   base.push(`fps=${fps}`);
   return base.join(",");
 }
 
 async function renderImageSegment(inputPath, outputPath, options) {
   const { width, height, fps, duration } = options;
-  const filter = buildVideoFilter(width, height, fps, duration, true);
   await run("ffmpeg", [
     "-y",
     "-loop", "1",
     "-t", String(duration),
     "-i", inputPath,
-    "-vf", filter,
-    "-an",
+    "-f", "lavfi",
+    "-t", String(duration),
+    "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+    "-vf", buildVideoFilter(width, height, fps, duration, true),
+    "-map", "0:v:0",
+    "-map", "1:a:0",
+    "-shortest",
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-crf", "21",
     "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-ar", "44100",
+    "-ac", "2",
     "-movflags", "+faststart",
     outputPath,
   ], { label: "render image segment" });
@@ -280,40 +223,63 @@ async function renderImageSegment(inputPath, outputPath, options) {
 async function renderVideoSegment(inputPath, outputPath, options) {
   const { width, height, fps, duration } = options;
   const filter = buildVideoFilter(width, height, fps, duration, false);
-  const args = ["-y", "-i", inputPath];
-  if (duration) args.push("-t", String(duration));
-  args.push(
+  const hasAudio = await hasAudioStream(inputPath);
+  if (hasAudio) {
+    const args = ["-y", "-i", inputPath];
+    if (duration) args.push("-t", String(duration));
+    args.push(
+      "-vf", filter,
+      "-map", "0:v:0",
+      "-map", "0:a:0",
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-crf", "21",
+      "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
+      "-b:a", "160k",
+      "-ar", "44100",
+      "-ac", "2",
+      "-shortest",
+      "-movflags", "+faststart",
+      outputPath
+    );
+    await run("ffmpeg", args, { label: "render video segment with audio", timeoutMs: 20 * 60 * 1000 });
+    return;
+  }
+
+  await run("ffmpeg", [
+    "-y",
+    "-i", inputPath,
+    "-f", "lavfi",
+    "-t", String(duration),
+    "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+    "-t", String(duration),
     "-vf", filter,
-    "-an",
+    "-map", "0:v:0",
+    "-map", "1:a:0",
+    "-shortest",
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-crf", "21",
     "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-ar", "44100",
+    "-ac", "2",
     "-movflags", "+faststart",
-    outputPath
-  );
-  await run("ffmpeg", args, { label: "render video segment", timeoutMs: 20 * 60 * 1000 });
+    outputPath,
+  ], { label: "render video segment with silent audio", timeoutMs: 20 * 60 * 1000 });
 }
 
 async function ensureBucket() {
   if (bucketReady) return;
   if (!supabase) throw new Error("Supabase is not configured for video output uploads");
-
   const { data: existing, error: listError } = await supabase.storage.listBuckets();
   if (listError) throw listError;
-
   if (!existing?.some((bucket) => bucket.name === OUTPUT_BUCKET)) {
-    const { error: createError } = await supabase.storage.createBucket(OUTPUT_BUCKET, {
-      public: true,
-      fileSizeLimit: MAX_DOWNLOAD_BYTES,
-      allowedMimeTypes: ["video/mp4"],
-    });
-
-    if (createError && !String(createError.message || "").toLowerCase().includes("already")) {
-      throw createError;
-    }
+    const { error: createError } = await supabase.storage.createBucket(OUTPUT_BUCKET, { public: true, fileSizeLimit: MAX_DOWNLOAD_BYTES, allowedMimeTypes: ["video/mp4"] });
+    if (createError && !String(createError.message || "").toLowerCase().includes("already")) throw createError;
   }
-
   bucketReady = true;
 }
 
@@ -321,39 +287,16 @@ async function uploadOutput(eventId, jobId, outputPath, outputName) {
   await ensureBucket();
   const buffer = await fs.readFile(outputPath);
   const storagePath = `events/${slugify(eventId, "event")}/films/${jobId}-${slugify(outputName, "memory-film")}.mp4`;
-
-  const { error: uploadError } = await supabase.storage.from(OUTPUT_BUCKET).upload(storagePath, buffer, {
-    contentType: "video/mp4",
-    cacheControl: "3600",
-    upsert: true,
-  });
+  const { error: uploadError } = await supabase.storage.from(OUTPUT_BUCKET).upload(storagePath, buffer, { contentType: "video/mp4", cacheControl: "3600", upsert: true });
   if (uploadError) throw uploadError;
-
   const { data } = supabase.storage.from(OUTPUT_BUCKET).getPublicUrl(storagePath);
   if (!data?.publicUrl) throw new Error("Could not create public MP4 URL");
-
-  return {
-    url: data.publicUrl,
-    bucket: OUTPUT_BUCKET,
-    path: storagePath,
-    bytes: buffer.length,
-  };
+  return { url: data.publicUrl, bucket: OUTPUT_BUCKET, path: storagePath, bytes: buffer.length };
 }
 
 function normaliseMedia(payload) {
-  const media = Array.isArray(payload.media)
-    ? payload.media
-    : Array.isArray(payload.items)
-      ? payload.items
-      : [];
-
-  return media
-    .map((item) => ({
-      ...item,
-      url: item.url || item.storage_url || item.storageUrl || item.src,
-    }))
-    .filter((item) => typeof item.url === "string" && item.url.startsWith("http"))
-    .slice(0, MAX_MEDIA_ITEMS);
+  const media = Array.isArray(payload.media) ? payload.media : Array.isArray(payload.items) ? payload.items : [];
+  return media.map((item) => ({ ...item, url: item.url || item.storage_url || item.storageUrl || item.src })).filter((item) => typeof item.url === "string" && item.url.startsWith("http")).slice(0, MAX_MEDIA_ITEMS);
 }
 
 async function renderJob(jobId) {
@@ -361,178 +304,72 @@ async function renderJob(jobId) {
   const payload = job.payload;
   const eventId = payload.eventId || payload.event_id || "event";
   const media = normaliseMedia(payload);
-
-  if (!media.length) {
-    throw new Error("No renderable media URLs were provided");
-  }
+  if (!media.length) throw new Error("No renderable media URLs were provided");
 
   const { width, height } = dimensionsForPayload(payload);
   const fps = normaliseNumber(payload.fps, 30, 15, 60);
   const defaultPhotoDuration = normaliseNumber(payload.durationPerPhoto || payload.photoDuration, 4, 1.5, 12);
   const maxVideoDuration = normaliseNumber(payload.maxVideoClipDuration || payload.videoDuration, 10, 2, 60);
   const outputName = payload.outputName || payload.title || "memory-film";
-
   const workDir = await fs.mkdtemp(path.join(tmpdir(), `memory-film-${jobId}-`));
-  console.log(`[VideoRender] Job ${jobId} using temp dir ${workDir}`);
 
   try {
     const segmentPaths = [];
-
     for (let index = 0; index < media.length; index += 1) {
       const item = media[index];
-      updateJob(jobId, {
-        status: "processing",
-        progress: Math.round((index / media.length) * 70),
-        currentStep: `Preparing media ${index + 1} of ${media.length}`,
-      });
-
+      updateJob(jobId, { status: "processing", progress: Math.round((index / media.length) * 70), currentStep: `Preparing media ${index + 1} of ${media.length}` });
       const probePath = path.join(workDir, `input-${index}.bin`);
       const downloaded = await downloadToFile(item.url, probePath);
       const mediaType = inferMediaType(item, downloaded.contentType);
-      const ext = inferExtension(item.url, downloaded.contentType);
-      const inputPath = path.join(workDir, `input-${index}${ext}`);
+      const inputPath = path.join(workDir, `input-${index}${inferExtension(item.url, downloaded.contentType)}`);
       await fs.rename(probePath, inputPath);
-
       const segmentPath = path.join(workDir, `segment-${String(index).padStart(4, "0")}.mp4`);
-      const duration = mediaType === "video"
-        ? normaliseNumber(item.duration || item.clipDuration || maxVideoDuration, maxVideoDuration, 1, 120)
-        : normaliseNumber(item.duration || defaultPhotoDuration, defaultPhotoDuration, 1, 20);
-
-      if (mediaType === "video") {
-        await renderVideoSegment(inputPath, segmentPath, { width, height, fps, duration });
-      } else {
-        await renderImageSegment(inputPath, segmentPath, { width, height, fps, duration });
-      }
-
+      const duration = mediaType === "video" ? normaliseNumber(item.duration || item.clipDuration || maxVideoDuration, maxVideoDuration, 1, 120) : normaliseNumber(item.duration || defaultPhotoDuration, defaultPhotoDuration, 1, 20);
+      if (mediaType === "video") await renderVideoSegment(inputPath, segmentPath, { width, height, fps, duration });
+      else await renderImageSegment(inputPath, segmentPath, { width, height, fps, duration });
       segmentPaths.push(segmentPath);
     }
 
-    updateJob(jobId, {
-      status: "processing",
-      progress: 76,
-      currentStep: "Joining film sections",
-    });
-
+    updateJob(jobId, { status: "processing", progress: 76, currentStep: "Joining film sections" });
     const concatListPath = path.join(workDir, "concat.txt");
-    const concatList = segmentPaths
-      .map((segmentPath) => `file '${segmentPath.replace(/'/g, "'\\''")}'`)
-      .join("\n");
-    await fs.writeFile(concatListPath, concatList, "utf8");
-
+    await fs.writeFile(concatListPath, segmentPaths.map((segmentPath) => `file '${segmentPath.replace(/'/g, "'\\''")}'`).join("\n"), "utf8");
     const joinedPath = path.join(workDir, "joined.mp4");
-    await run("ffmpeg", [
-      "-y",
-      "-f", "concat",
-      "-safe", "0",
-      "-i", concatListPath,
-      "-c", "copy",
-      joinedPath,
-    ], { label: "concat segments", timeoutMs: 20 * 60 * 1000 });
+    await run("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", concatListPath, "-c", "copy", joinedPath], { label: "concat segments", timeoutMs: 20 * 60 * 1000 });
 
-    updateJob(jobId, {
-      status: "processing",
-      progress: 86,
-      currentStep: "Adding audio and finalising MP4",
-    });
-
+    updateJob(jobId, { status: "processing", progress: 88, currentStep: "Finalising MP4" });
     const outputPath = path.join(workDir, "final.mp4");
     const audioUrl = payload.audioUrl || payload.musicUrl || payload.soundtrackUrl || "";
-
     if (audioUrl) {
       const audioTempPath = path.join(workDir, "audio-source.bin");
       const audioInfo = await downloadToFile(audioUrl, audioTempPath);
-      const audioExt = inferExtension(audioUrl, audioInfo.contentType);
-      const audioPath = path.join(workDir, `audio${audioExt}`);
+      const audioPath = path.join(workDir, `audio${inferExtension(audioUrl, audioInfo.contentType)}`);
       await fs.rename(audioTempPath, audioPath);
-
-      await run("ffmpeg", [
-        "-y",
-        "-i", joinedPath,
-        "-i", audioPath,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-shortest",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "160k",
-        "-movflags", "+faststart",
-        outputPath,
-      ], { label: "mux soundtrack", timeoutMs: 20 * 60 * 1000 });
+      await run("ffmpeg", ["-y", "-i", joinedPath, "-i", audioPath, "-map", "0:v:0", "-map", "1:a:0", "-shortest", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", outputPath], { label: "mux soundtrack", timeoutMs: 20 * 60 * 1000 });
     } else {
-      await run("ffmpeg", [
-        "-y",
-        "-i", joinedPath,
-        "-f", "lavfi",
-        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-        "-shortest",
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        outputPath,
-      ], { label: "add silent audio", timeoutMs: 20 * 60 * 1000 });
+      await run("ffmpeg", ["-y", "-i", joinedPath, "-c", "copy", "-movflags", "+faststart", outputPath], { label: "faststart final", timeoutMs: 20 * 60 * 1000 });
     }
 
-    updateJob(jobId, {
-      status: "processing",
-      progress: 94,
-      currentStep: "Uploading MP4",
-    });
-
+    updateJob(jobId, { status: "processing", progress: 94, currentStep: "Uploading MP4" });
     const upload = await uploadOutput(eventId, jobId, outputPath, outputName);
-
-    updateJob(jobId, {
-      status: "complete",
-      progress: 100,
-      currentStep: "Complete",
-      outputUrl: upload.url,
-      outputBucket: upload.bucket,
-      outputPath: upload.path,
-      outputBytes: upload.bytes,
-      completedAt: nowIso(),
-      payload: undefined,
-    });
-
-    console.log(`[VideoRender] Job ${jobId} complete: ${upload.url}`);
+    updateJob(jobId, { status: "complete", progress: 100, currentStep: "Complete", outputUrl: upload.url, outputBucket: upload.bucket, outputPath: upload.path, outputBytes: upload.bytes, completedAt: nowIso(), payload: undefined });
   } finally {
-    try {
-      await fs.rm(workDir, { recursive: true, force: true });
-    } catch (error) {
-      console.warn(`[VideoRender] Could not remove temp dir ${workDir}:`, safeMessage(error));
-    }
+    await fs.rm(workDir, { recursive: true, force: true }).catch((error) => console.warn("[VideoRender] Could not remove temp dir:", safeMessage(error)));
   }
 }
 
 function processQueue() {
   cleanOldJobs();
-
   while (activeRenders < MAX_CONCURRENT_RENDERS && queue.length) {
     const jobId = queue.shift();
     activeRenders += 1;
-
-    updateJob(jobId, {
-      status: "processing",
-      progress: 1,
-      startedAt: nowIso(),
-      currentStep: "Starting render",
+    updateJob(jobId, { status: "processing", progress: 1, startedAt: nowIso(), currentStep: "Starting render" });
+    renderJob(jobId).catch((error) => {
+      console.error(`[VideoRender] Job ${jobId} failed:`, error);
+      updateJob(jobId, { status: "failed", progress: 100, currentStep: "Failed", error: safeMessage(error), failedAt: nowIso(), payload: undefined });
+    }).finally(() => {
+      activeRenders -= 1;
+      processQueue();
     });
-
-    renderJob(jobId)
-      .catch((error) => {
-        console.error(`[VideoRender] Job ${jobId} failed:`, error);
-        updateJob(jobId, {
-          status: "failed",
-          progress: 100,
-          currentStep: "Failed",
-          error: safeMessage(error),
-          failedAt: nowIso(),
-          payload: undefined,
-        });
-      })
-      .finally(() => {
-        activeRenders -= 1;
-        processQueue();
-      });
   }
 }
 
@@ -543,73 +380,30 @@ function publicJob(job) {
 }
 
 async function handle(req, res) {
-  if (req.method === "OPTIONS") {
-    return json(res, 204, {});
-  }
-
+  if (req.method === "OPTIONS") return json(res, 204, {});
   const url = new URL(req.url, `http://${req.headers.host}`);
-
-  if (req.method === "GET" && url.pathname === "/health") {
-    return json(res, 200, {
-      ok: true,
-      service: "memory-lane-video-render-worker",
-      activeRenders,
-      queued: queue.length,
-      hasSupabase: !!supabase,
-      hasSecret: !!RENDER_SECRET,
-    });
-  }
-
-  if (!isAuthed(req)) {
-    return json(res, 401, { error: "Unauthorised" });
-  }
-
+  if (req.method === "GET" && url.pathname === "/health") return json(res, 200, { ok: true, service: "memory-lane-video-render-worker", activeRenders, queued: queue.length, hasSupabase: !!supabase, hasSecret: !!RENDER_SECRET });
+  if (!isAuthed(req)) return json(res, 401, { error: "Unauthorised" });
   if (req.method === "POST" && url.pathname === "/render") {
     try {
       const payload = await readJsonBody(req);
       const media = normaliseMedia(payload);
-
-      if (!media.length) {
-        return json(res, 400, { error: "No media URLs supplied" });
-      }
-
+      if (!media.length) return json(res, 400, { error: "No media URLs supplied" });
       const jobId = crypto.randomUUID();
       const createdAt = nowIso();
-
-      jobs.set(jobId, {
-        jobId,
-        status: "queued",
-        progress: 0,
-        currentStep: "Queued",
-        createdAt,
-        updatedAt: createdAt,
-        mediaCount: media.length,
-        payload: {
-          ...payload,
-          media,
-        },
-      });
-
+      jobs.set(jobId, { jobId, status: "queued", progress: 0, currentStep: "Queued", createdAt, updatedAt: createdAt, mediaCount: media.length, payload: { ...payload, media } });
       queue.push(jobId);
       processQueue();
-
-      return json(res, 202, {
-        jobId,
-        status: "queued",
-        statusPath: `/jobs/${jobId}`,
-      });
+      return json(res, 202, { jobId, status: "queued", statusPath: `/jobs/${jobId}` });
     } catch (error) {
       return json(res, 400, { error: safeMessage(error) });
     }
   }
-
   const jobMatch = url.pathname.match(/^\/jobs\/([a-f0-9-]+)$/i);
   if (req.method === "GET" && jobMatch) {
     const job = publicJob(jobs.get(jobMatch[1]));
-    if (!job) return json(res, 404, { error: "Job not found" });
-    return json(res, 200, job);
+    return job ? json(res, 200, job) : json(res, 404, { error: "Job not found" });
   }
-
   return json(res, 404, { error: "Not found" });
 }
 
