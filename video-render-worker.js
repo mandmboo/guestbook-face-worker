@@ -90,6 +90,9 @@ function inferExtension(url, contentType = "") {
   if (type.includes("webm")) return ".webm";
   if (type.includes("mp4")) return ".mp4";
   if (type.includes("mpeg") || type.includes("mp3")) return ".mp3";
+  if (type.includes("m4a")) return ".m4a";
+  if (type.includes("aac")) return ".aac";
+  if (type.includes("ogg")) return ".ogg";
   if (type.includes("wav")) return ".wav";
   try {
     const ext = path.extname(new URL(url).pathname).toLowerCase();
@@ -100,13 +103,28 @@ function inferExtension(url, contentType = "") {
 
 function inferMediaType(item, contentType = "") {
   const explicit = String(item.type || item.kind || "").toLowerCase();
+  if (explicit.includes("audio") || explicit.includes("voice")) return "audio";
   if (explicit.includes("video")) return "video";
   if (explicit.includes("image") || explicit.includes("photo")) return "image";
   const type = contentType.toLowerCase();
+  if (type.startsWith("audio/")) return "audio";
   if (type.startsWith("video/")) return "video";
   if (type.startsWith("image/")) return "image";
   const url = String(item.url || item.storage_url || item.src || "").toLowerCase();
-  return /\.(mp4|mov|webm|m4v)(\?|#|$)/.test(url) ? "video" : "image";
+  if (/\.(mp3|m4a|wav|aac|ogg)(\?|#|$)/.test(url)) return "audio";
+  if (/\.(mp4|mov|webm|m4v)(\?|#|$)/.test(url)) return "video";
+  return "image";
+}
+
+function normaliseNumber(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function explicitDuration(item, max = 1800) {
+  if (item.duration == null && item.clipDuration == null) return null;
+  return normaliseNumber(item.duration ?? item.clipDuration, null, 1, max);
 }
 
 async function run(command, args, options = {}) {
@@ -130,6 +148,17 @@ async function run(command, args, options = {}) {
       else reject(new Error(`${label} failed with code ${code}: ${stderr || stdout}`));
     });
   });
+}
+
+async function probeDuration(inputPath) {
+  try {
+    const { stdout } = await run("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", inputPath], { label: "probe duration", timeoutMs: 30000 });
+    const duration = Number.parseFloat(stdout.trim());
+    return Number.isFinite(duration) && duration > 0 ? duration : null;
+  } catch (error) {
+    console.warn("[VideoRender] Could not probe duration:", safeMessage(error));
+    return null;
+  }
 }
 
 async function hasAudioStream(inputPath) {
@@ -170,12 +199,6 @@ async function downloadToFile(url, destination) {
   }
 }
 
-function normaliseNumber(value, fallback, min, max) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, n));
-}
-
 function dimensionsForPayload(payload) {
   const aspect = String(payload.aspectRatio || payload.aspect || "vertical").toLowerCase();
   const width = normaliseNumber(payload.width, aspect.includes("square") ? 1080 : aspect.includes("landscape") ? 1920 : 1080, 320, 3840);
@@ -196,27 +219,12 @@ function buildVideoFilter(width, height, fps, duration, fade = false) {
 async function renderImageSegment(inputPath, outputPath, options) {
   const { width, height, fps, duration } = options;
   await run("ffmpeg", [
-    "-y",
-    "-loop", "1",
-    "-t", String(duration),
-    "-i", inputPath,
-    "-f", "lavfi",
-    "-t", String(duration),
-    "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+    "-y", "-loop", "1", "-t", String(duration), "-i", inputPath,
+    "-f", "lavfi", "-t", String(duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
     "-vf", buildVideoFilter(width, height, fps, duration, true),
-    "-map", "0:v:0",
-    "-map", "1:a:0",
-    "-shortest",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "21",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-b:a", "128k",
-    "-ar", "44100",
-    "-ac", "2",
-    "-movflags", "+faststart",
-    outputPath,
+    "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart", outputPath,
   ], { label: "render image segment" });
 }
 
@@ -224,51 +232,46 @@ async function renderVideoSegment(inputPath, outputPath, options) {
   const { width, height, fps, duration } = options;
   const filter = buildVideoFilter(width, height, fps, duration, false);
   const hasAudio = await hasAudioStream(inputPath);
+
   if (hasAudio) {
     const args = ["-y", "-i", inputPath];
     if (duration) args.push("-t", String(duration));
     args.push(
       "-vf", filter,
-      "-map", "0:v:0",
-      "-map", "0:a:0",
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "21",
-      "-pix_fmt", "yuv420p",
-      "-c:a", "aac",
-      "-b:a", "160k",
-      "-ar", "44100",
-      "-ac", "2",
-      "-shortest",
-      "-movflags", "+faststart",
-      outputPath
+      "-map", "0:v:0", "-map", "0:a:0",
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
+      "-shortest", "-movflags", "+faststart", outputPath
     );
-    await run("ffmpeg", args, { label: "render video segment with audio", timeoutMs: 20 * 60 * 1000 });
+    await run("ffmpeg", args, { label: "render video segment with audio", timeoutMs: 30 * 60 * 1000 });
     return;
   }
 
+  const silentDuration = duration || await probeDuration(inputPath) || 10;
   await run("ffmpeg", [
+    "-y", "-i", inputPath,
+    "-f", "lavfi", "-t", String(silentDuration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+    "-t", String(silentDuration), "-vf", filter,
+    "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart", outputPath,
+  ], { label: "render video segment with silent audio", timeoutMs: 30 * 60 * 1000 });
+}
+
+async function renderAudioSegment(inputPath, outputPath, options) {
+  const { width, height, fps, duration } = options;
+  const args = [
     "-y",
+    "-f", "lavfi", "-i", `color=c=0x111827:s=${width}x${height}:r=${fps}`,
     "-i", inputPath,
-    "-f", "lavfi",
-    "-t", String(duration),
-    "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-    "-t", String(duration),
-    "-vf", filter,
-    "-map", "0:v:0",
-    "-map", "1:a:0",
-    "-shortest",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "21",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-b:a", "128k",
-    "-ar", "44100",
-    "-ac", "2",
-    "-movflags", "+faststart",
-    outputPath,
-  ], { label: "render video segment with silent audio", timeoutMs: 20 * 60 * 1000 });
+  ];
+  if (duration) args.push("-t", String(duration));
+  args.push(
+    "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart", outputPath
+  );
+  await run("ffmpeg", args, { label: "render audio segment", timeoutMs: 30 * 60 * 1000 });
 }
 
 async function ensureBucket() {
@@ -309,7 +312,6 @@ async function renderJob(jobId) {
   const { width, height } = dimensionsForPayload(payload);
   const fps = normaliseNumber(payload.fps, 30, 15, 60);
   const defaultPhotoDuration = normaliseNumber(payload.durationPerPhoto || payload.photoDuration, 4, 1.5, 12);
-  const maxVideoDuration = normaliseNumber(payload.maxVideoClipDuration || payload.videoDuration, 10, 2, 60);
   const outputName = payload.outputName || payload.title || "memory-film";
   const workDir = await fs.mkdtemp(path.join(tmpdir(), `memory-film-${jobId}-`));
 
@@ -324,8 +326,10 @@ async function renderJob(jobId) {
       const inputPath = path.join(workDir, `input-${index}${inferExtension(item.url, downloaded.contentType)}`);
       await fs.rename(probePath, inputPath);
       const segmentPath = path.join(workDir, `segment-${String(index).padStart(4, "0")}.mp4`);
-      const duration = mediaType === "video" ? normaliseNumber(item.duration || item.clipDuration || maxVideoDuration, maxVideoDuration, 1, 120) : normaliseNumber(item.duration || defaultPhotoDuration, defaultPhotoDuration, 1, 20);
+      const duration = mediaType === "image" ? normaliseNumber(item.duration || defaultPhotoDuration, defaultPhotoDuration, 1, 20) : explicitDuration(item);
+
       if (mediaType === "video") await renderVideoSegment(inputPath, segmentPath, { width, height, fps, duration });
+      else if (mediaType === "audio") await renderAudioSegment(inputPath, segmentPath, { width, height, fps, duration });
       else await renderImageSegment(inputPath, segmentPath, { width, height, fps, duration });
       segmentPaths.push(segmentPath);
     }
@@ -334,7 +338,7 @@ async function renderJob(jobId) {
     const concatListPath = path.join(workDir, "concat.txt");
     await fs.writeFile(concatListPath, segmentPaths.map((segmentPath) => `file '${segmentPath.replace(/'/g, "'\\''")}'`).join("\n"), "utf8");
     const joinedPath = path.join(workDir, "joined.mp4");
-    await run("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", concatListPath, "-c", "copy", joinedPath], { label: "concat segments", timeoutMs: 20 * 60 * 1000 });
+    await run("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", concatListPath, "-c", "copy", joinedPath], { label: "concat segments", timeoutMs: 30 * 60 * 1000 });
 
     updateJob(jobId, { status: "processing", progress: 88, currentStep: "Finalising MP4" });
     const outputPath = path.join(workDir, "final.mp4");
@@ -344,9 +348,9 @@ async function renderJob(jobId) {
       const audioInfo = await downloadToFile(audioUrl, audioTempPath);
       const audioPath = path.join(workDir, `audio${inferExtension(audioUrl, audioInfo.contentType)}`);
       await fs.rename(audioTempPath, audioPath);
-      await run("ffmpeg", ["-y", "-i", joinedPath, "-i", audioPath, "-map", "0:v:0", "-map", "1:a:0", "-shortest", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", outputPath], { label: "mux soundtrack", timeoutMs: 20 * 60 * 1000 });
+      await run("ffmpeg", ["-y", "-i", joinedPath, "-i", audioPath, "-map", "0:v:0", "-map", "1:a:0", "-shortest", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", outputPath], { label: "mux soundtrack", timeoutMs: 30 * 60 * 1000 });
     } else {
-      await run("ffmpeg", ["-y", "-i", joinedPath, "-c", "copy", "-movflags", "+faststart", outputPath], { label: "faststart final", timeoutMs: 20 * 60 * 1000 });
+      await run("ffmpeg", ["-y", "-i", joinedPath, "-c", "copy", "-movflags", "+faststart", outputPath], { label: "faststart final", timeoutMs: 30 * 60 * 1000 });
     }
 
     updateJob(jobId, { status: "processing", progress: 94, currentStep: "Uploading MP4" });
