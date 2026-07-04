@@ -4,7 +4,6 @@ import { createWriteStream, promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { pipeline } from "node:stream/promises";
 import { createClient } from "@supabase/supabase-js";
 
 const PORT = Number(process.env.PORT || 3000);
@@ -78,10 +77,14 @@ function cleanOldJobs() {
 
 function isAuthed(req) {
   const provided = req.headers["x-render-secret"] || req.headers.authorization?.replace(/^Bearer\s+/i, "");
-  return !!RENDER_SECRET && crypto.timingSafeEqual(
-    Buffer.from(String(provided || "")),
-    Buffer.from(RENDER_SECRET)
-  );
+  if (!RENDER_SECRET || !provided) return false;
+
+  const providedBuffer = Buffer.from(String(provided));
+  const secretBuffer = Buffer.from(RENDER_SECRET);
+
+  if (providedBuffer.length !== secretBuffer.length) return false;
+
+  return crypto.timingSafeEqual(providedBuffer, secretBuffer);
 }
 
 async function readJsonBody(req) {
@@ -195,10 +198,6 @@ async function downloadToFile(url, destination) {
     const writeStream = createWriteStream(destination);
     const reader = response.body.getReader();
 
-    writeStream.on("error", (error) => {
-      throw error;
-    });
-
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
@@ -306,7 +305,7 @@ async function ensureBucket() {
   if (!existing?.some((bucket) => bucket.name === OUTPUT_BUCKET)) {
     const { error: createError } = await supabase.storage.createBucket(OUTPUT_BUCKET, {
       public: true,
-      fileSizeLimit: String(MAX_DOWNLOAD_BYTES),
+      fileSizeLimit: MAX_DOWNLOAD_BYTES,
       allowedMimeTypes: ["video/mp4"],
     });
 
