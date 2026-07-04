@@ -6,8 +6,16 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm install --omit=dev
+RUN printf '%s\n' \
+  '{' \
+  '  "name": "memory-lane-video-render-worker",' \
+  '  "version": "1.0.0",' \
+  '  "type": "module",' \
+  '  "dependencies": {' \
+  '    "@supabase/supabase-js": "^2.49.1"' \
+  '  }' \
+  '}' > package.json \
+  && npm install --omit=dev
 
 COPY video-render-worker.js ./video-render-worker.js
 
