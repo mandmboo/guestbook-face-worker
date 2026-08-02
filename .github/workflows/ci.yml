@@ -12,16 +12,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Install native canvas dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev libpixman-1-dev
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
       - name: Validate worker syntax
         run: node --check worker.js
       - name: Verify queue integration
@@ -30,3 +20,9 @@ jobs:
           grep -q "claim_photo_face_index_jobs" worker.js
           grep -q "guest_upload_id" worker.js
           grep -q "event_photo_id" worker.js
+      - name: Build the Railway face-worker image
+        run: docker build --tag memory-lane-face-worker:test .
+      - name: Verify the container starts the face worker
+        run: |
+          docker inspect --format='{{json .Config.Cmd}}' memory-lane-face-worker:test | grep -q 'worker.js'
+          docker run --rm --entrypoint node memory-lane-face-worker:test --check worker.js
