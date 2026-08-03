@@ -4,7 +4,7 @@
   "type": "module",
   "main": "worker.js",
   "scripts": {
-    "start": "node worker.js"
+    "start": "node worker-entry.js"
   },
   "engines": {
     "node": "22.x"
