@@ -11,6 +11,7 @@ const RENDER_SECRET = process.env.RENDER_SECRET || process.env.MEMORY_FILM_RENDE
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const OUTPUT_BUCKET = process.env.RENDER_OUTPUT_BUCKET || "rendered-films";
+const VOICE_OUTPUT_BUCKET = process.env.VOICE_OUTPUT_BUCKET || "guest-uploads";
 const MAX_MEDIA_ITEMS = Number(process.env.MAX_RENDER_MEDIA_ITEMS || 120);
 const MAX_DOWNLOAD_BYTES = Number(process.env.MAX_RENDER_DOWNLOAD_BYTES || 450 * 1024 * 1024);
 const DOWNLOAD_TIMEOUT_MS = Number(process.env.RENDER_DOWNLOAD_TIMEOUT_MS || 90000);
@@ -317,6 +318,71 @@ async function ensureBucket() {
   bucketReady = true;
 }
 
+async function uploadNormalizedVoice(eventId, recordingId, outputPath) {
+  if (!supabase) throw new Error("Supabase is not configured for normalized voice uploads");
+  const buffer = await fs.readFile(outputPath);
+  const storagePath = `${eventId}/physical-audio-normalized/${recordingId}.mp3`;
+
+  const { error: uploadError } = await supabase.storage.from(VOICE_OUTPUT_BUCKET).upload(storagePath, buffer, {
+    contentType: "audio/mpeg",
+    cacheControl: "3600",
+    upsert: true,
+  });
+  if (uploadError) throw uploadError;
+
+  const { data } = supabase.storage.from(VOICE_OUTPUT_BUCKET).getPublicUrl(storagePath);
+  if (!data?.publicUrl) throw new Error("Could not create normalized voice URL");
+
+  return {
+    url: data.publicUrl,
+    bucket: VOICE_OUTPUT_BUCKET,
+    path: storagePath,
+    bytes: buffer.length,
+  };
+}
+
+async function normalizeVoice(payload) {
+  const eventId = String(payload?.eventId || payload?.event_id || "").trim();
+  const recordingId = String(payload?.recordingId || payload?.recording_id || "").trim();
+  const audioUrl = String(payload?.audioUrl || payload?.audio_url || "").trim();
+
+  if (!eventId || !recordingId || !/^https?:\/\//i.test(audioUrl)) {
+    throw new Error("eventId, recordingId and a valid audioUrl are required");
+  }
+
+  const workDir = await fs.mkdtemp(path.join(tmpdir(), `voice-normalize-${recordingId}-`));
+  try {
+    const sourcePath = path.join(workDir, "source.bin");
+    await downloadToFile(audioUrl, sourcePath);
+
+    const outputPath = path.join(workDir, "normalized.mp3");
+    await run("ffmpeg", [
+      "-y",
+      "-hide_banner",
+      "-loglevel", "error",
+      "-i", sourcePath,
+      "-vn",
+      "-map_metadata", "-1",
+      "-ar", "44100",
+      "-ac", "1",
+      "-c:a", "libmp3lame",
+      "-b:a", "128k",
+      outputPath,
+    ], { label: "normalize voice recording", timeoutMs: 2 * 60 * 1000 });
+
+    const upload = await uploadNormalizedVoice(eventId, recordingId, outputPath);
+    return {
+      ok: true,
+      normalizedUrl: upload.url,
+      bucket: upload.bucket,
+      path: upload.path,
+      bytes: upload.bytes,
+    };
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true }).catch(() => null);
+  }
+}
+
 async function uploadOutput(eventId, jobId, outputPath, outputName) {
   await ensureBucket();
   const buffer = await fs.readFile(outputPath);
@@ -562,6 +628,17 @@ async function handle(req, res) {
 
   if (!isAuthed(req)) {
     return json(res, 401, { error: "Unauthorised" });
+  }
+
+  if (req.method === "POST" && url.pathname === "/normalize-audio") {
+    try {
+      const payload = await readJsonBody(req);
+      const result = await normalizeVoice(payload);
+      return json(res, 200, result);
+    } catch (error) {
+      console.error("[VideoRender] Voice normalization failed:", error);
+      return json(res, 422, { error: safeMessage(error) });
+    }
   }
 
   if (req.method === "POST" && url.pathname === "/render") {
