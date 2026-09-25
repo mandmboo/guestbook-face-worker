@@ -13,7 +13,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Validate worker syntax
-        run: node --check worker.js
+        run: |
+          node --check worker.js
+          node --check video-render-worker.js
       - name: Verify queue integration
         run: |
           grep -q "enqueue_photo_face_index_jobs" worker.js
@@ -26,3 +28,19 @@ jobs:
         run: |
           docker inspect --format='{{json .Config.Cmd}}' memory-lane-face-worker:test | grep -q 'worker.js'
           docker run --rm --entrypoint node memory-lane-face-worker:test --check worker.js
+      - name: Build the Railway video worker image
+        run: docker build -f Dockerfile.video --tag memory-lane-video-worker:test .
+      - name: Verify Voice audio processing in the video worker
+        run: |
+          docker inspect --format='{{json .Config.Cmd}}' memory-lane-video-worker:test | grep -q 'video-render-worker.js'
+          docker run --rm --entrypoint node memory-lane-video-worker:test --check video-render-worker.js
+          docker run --rm --entrypoint sh memory-lane-video-worker:test -lc '
+            set -eu
+            ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=3" -c:a libmp3lame /tmp/source.mp3
+            original="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 /tmp/source.mp3)"
+            ffmpeg -hide_banner -loglevel error -y -i /tmp/source.mp3 -vn -map 0:a:0 -map_metadata -1 -af "highpass=f=70,lowpass=f=12000,afftdn=nf=-25:tn=1" -ar 44100 -ac 1 -c:a libmp3lame -b:a 128k /tmp/clean.mp3
+            ffmpeg -hide_banner -loglevel error -y -i /tmp/source.mp3 -vn -map 0:a:0 -map_metadata -1 -af "highpass=f=90,lowpass=f=9000,afftdn=nf=-35:tn=1,acompressor=threshold=0.08:ratio=3:attack=20:release=250:makeup=1.5" -ar 44100 -ac 1 -c:a libmp3lame -b:a 128k /tmp/super.mp3
+            clean="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 /tmp/clean.mp3)"
+            super="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 /tmp/super.mp3)"
+            awk -v a="$original" -v b="$clean" -v c="$super" "BEGIN { if (b < a-0.75 || c < a-0.75) exit 1 }"
+          '
