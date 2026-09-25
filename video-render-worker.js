@@ -318,10 +318,44 @@ async function ensureBucket() {
   bucketReady = true;
 }
 
-async function uploadNormalizedVoice(eventId, recordingId, outputPath) {
+function normalizeVoiceMode(payload) {
+  const mode = String(payload?.mode || "playback").trim().toLowerCase();
+  if (!["playback", "clean", "super_clean"].includes(mode)) {
+    throw new Error("Voice processing mode must be playback, clean or super_clean");
+  }
+  return mode;
+}
+
+function voiceFilterForMode(mode) {
+  if (mode === "clean") {
+    return "highpass=f=70,lowpass=f=12000,afftdn=nf=-25:tn=1";
+  }
+  if (mode === "super_clean") {
+    return "highpass=f=90,lowpass=f=9000,afftdn=nf=-35:tn=1,acompressor=threshold=0.08:ratio=3:attack=20:release=250:makeup=1.5";
+  }
+  return "";
+}
+
+async function probeDurationSeconds(filePath) {
+  const result = await run("ffprobe", [
+    "-v", "error",
+    "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    filePath,
+  ], { label: "probe voice duration", timeoutMs: 30 * 1000 });
+  const duration = Number(String(result.stdout || "").trim());
+  return Number.isFinite(duration) && duration > 0 ? Number(duration.toFixed(3)) : 0;
+}
+
+async function uploadNormalizedVoice(eventId, recordingId, outputPath, mode) {
   if (!supabase) throw new Error("Supabase is not configured for normalized voice uploads");
   const buffer = await fs.readFile(outputPath);
-  const storagePath = `${eventId}/physical-audio-normalized/${recordingId}.mp3`;
+  const folder = mode === "clean"
+    ? "physical-audio-clean"
+    : mode === "super_clean"
+      ? "physical-audio-super-clean"
+      : "physical-audio-normalized";
+  const storagePath = `${eventId}/${folder}/${recordingId}.mp3`;
 
   const { error: uploadError } = await supabase.storage.from(VOICE_OUTPUT_BUCKET).upload(storagePath, buffer, {
     contentType: "audio/mpeg",
@@ -331,7 +365,7 @@ async function uploadNormalizedVoice(eventId, recordingId, outputPath) {
   if (uploadError) throw uploadError;
 
   const { data } = supabase.storage.from(VOICE_OUTPUT_BUCKET).getPublicUrl(storagePath);
-  if (!data?.publicUrl) throw new Error("Could not create normalized voice URL");
+  if (!data?.publicUrl) throw new Error("Could not create processed voice URL");
 
   return {
     url: data.publicUrl,
@@ -345,6 +379,7 @@ async function normalizeVoice(payload) {
   const eventId = String(payload?.eventId || payload?.event_id || "").trim();
   const recordingId = String(payload?.recordingId || payload?.recording_id || "").trim();
   const audioUrl = String(payload?.audioUrl || payload?.audio_url || "").trim();
+  const mode = normalizeVoiceMode(payload);
 
   if (!eventId || !recordingId || !/^https?:\/\//i.test(audioUrl)) {
     throw new Error("eventId, recordingId and a valid audioUrl are required");
@@ -354,29 +389,61 @@ async function normalizeVoice(payload) {
   try {
     const sourcePath = path.join(workDir, "source.bin");
     await downloadToFile(audioUrl, sourcePath);
+    const originalDurationSeconds = await probeDurationSeconds(sourcePath);
 
-    const outputPath = path.join(workDir, "normalized.mp3");
-    await run("ffmpeg", [
+    const outputPath = path.join(workDir, `${mode}.mp3`);
+    const ffmpegArgs = [
       "-y",
       "-hide_banner",
       "-loglevel", "error",
       "-i", sourcePath,
       "-vn",
+      "-map", "0:a:0",
       "-map_metadata", "-1",
+    ];
+    const filter = voiceFilterForMode(mode);
+    if (filter) ffmpegArgs.push("-af", filter);
+    ffmpegArgs.push(
       "-ar", "44100",
       "-ac", "1",
       "-c:a", "libmp3lame",
       "-b:a", "128k",
       outputPath,
-    ], { label: "normalize voice recording", timeoutMs: 2 * 60 * 1000 });
+    );
 
-    const upload = await uploadNormalizedVoice(eventId, recordingId, outputPath);
+    await run("ffmpeg", ffmpegArgs, {
+      label: `voice ${mode} processing`,
+      timeoutMs: 2 * 60 * 1000,
+    });
+
+    const outputDurationSeconds = await probeDurationSeconds(outputPath);
+    const durationLoss = originalDurationSeconds > 0 && outputDurationSeconds > 0
+      ? originalDurationSeconds - outputDurationSeconds
+      : 0;
+    const fullDurationVerified = originalDurationSeconds > 0
+      && outputDurationSeconds > 0
+      && (durationLoss <= 0.75 || outputDurationSeconds / originalDurationSeconds >= 0.985);
+
+    if (originalDurationSeconds > 0 && outputDurationSeconds > 0 && !fullDurationVerified) {
+      throw new Error(
+        `Processed voice duration is too short (${outputDurationSeconds}s from ${originalDurationSeconds}s). Original preserved.`
+      );
+    }
+
+    const upload = await uploadNormalizedVoice(eventId, recordingId, outputPath, mode);
     return {
       ok: true,
+      mode,
       normalizedUrl: upload.url,
       bucket: upload.bucket,
       path: upload.path,
       bytes: upload.bytes,
+      originalDurationSeconds,
+      outputDurationSeconds,
+      fullDurationVerified,
+      preserveFullDuration: true,
+      fadeApplied: false,
+      trimApplied: false,
     };
   } finally {
     await fs.rm(workDir, { recursive: true, force: true }).catch(() => null);
