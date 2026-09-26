@@ -690,6 +690,7 @@ async function handle(req, res) {
       queued: queue.length,
       hasSupabase: !!supabase,
       hasSecret: !!RENDER_SECRET,
+      voiceNormalizer: "v2-full-length",
     });
   }
 
