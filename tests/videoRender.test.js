@@ -6,6 +6,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import vm from "node:vm";
 import test, { before, after } from "node:test";
+import { TECHNICAL_JPEG_BASE64 } from "./fixtures/technicalJpeg.js";
 
 // Real codecs, synthetic media, stubbed HTTP/Storage: no credentials, network,
 // customer photos, buckets or production services are used by these tests.
@@ -29,13 +30,13 @@ function probe(file) {
   return JSON.parse(result.stdout);
 }
 
-function assertVideo(file, duration, audio = false) {
+function assertVideo(file, duration, audio = false, dimensions = options) {
   const info = probe(file);
   const video = info.streams.find((stream) => stream.codec_type === "video");
   assert.ok(video, "video stream exists");
   assert.equal(video.codec_name, "h264");
-  assert.equal(video.width, options.width);
-  assert.equal(video.height, options.height);
+  assert.equal(video.width, dimensions.width);
+  assert.equal(video.height, dimensions.height);
   assert.ok(["yuv420p", "yuvj420p"].includes(video.pix_fmt), video.pix_fmt);
   assert.ok(Math.abs(Number(video.duration) - duration) < 0.15, `video duration ${video.duration} != ${duration}`);
   assert.ok(Number.isFinite(Number(info.format.duration)) && Number(info.format.duration) > 0);
@@ -108,7 +109,12 @@ before(async () => {
     assert.equal(result.status, 0, `${binary} is required; run in Dockerfile.video or install FFmpeg`);
   }
   dir = await fs.mkdtemp(path.join(tmpdir(), "video-render-regressions-"));
-  fixtures = Object.fromEntries(["jpg", "png", "webp", "gif", "still.gif", "finite.gif", "limited.gif", "variable.gif", "mislabelled.jpg", "broken.png", "video.mp4", "audio.wav"].map((name) => [name, path.join(dir, `fixture.${name}`)]));
+  fixtures = Object.fromEntries(["jpg", "jfif.jpg", "exif.jpg", "png", "webp", "gif", "still.gif", "finite.gif", "limited.gif", "variable.gif", "mislabelled.jpg", "broken.png", "video.mp4", "audio.wav"].map((name) => [name, path.join(dir, `fixture.${name}`)]));
+  const jfif = Buffer.from(TECHNICAL_JPEG_BASE64, "base64");
+  await fs.writeFile(fixtures["jfif.jpg"], jfif);
+  // Minimal valid EXIF orientation 6 (90 degrees clockwise), no identity data.
+  const exif = Buffer.from("ffe1002245786966000049492a0008000000010012010300010000000600000000000000", "hex");
+  await fs.writeFile(fixtures["exif.jpg"], Buffer.concat([jfif.subarray(0, 2), exif, jfif.subarray(2)]));
   for (const ext of ["jpg", "png", "webp", "still.gif"]) {
     ffmpeg(["-f", "lavfi", "-i", "color=c=red:size=64x48", "-frames:v", "1", fixtures[ext]]);
   }
@@ -138,7 +144,7 @@ before(async () => {
 
 after(async () => { if (dir) await fs.rm(dir, { recursive: true, force: true }); });
 
-for (const format of ["jpg", "png", "webp", "still.gif", "gif", "finite.gif", "limited.gif", "variable.gif", "mislabelled.jpg"]) {
+for (const format of ["jpg", "jfif.jpg", "exif.jpg", "png", "webp", "still.gif", "gif", "finite.gif", "limited.gif", "variable.gif", "mislabelled.jpg"]) {
   test(`real FFmpeg renders ${format} for the whole bounded photo slot`, { timeout: 15000 }, async () => {
     const worker = loadWorker();
     const output = path.join(dir, `${format}.mp4`);
@@ -322,5 +328,61 @@ test("GIF timing timeout is bounded, reaped and cleans up the job", { timeout: 5
   assert.match(worker.jobs.get("gif-timeout").error, /probe GIF timing timed out/);
   assert.equal(worker.uploads.length, 0);
   for (const child of worker.children) assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+  await assertRemoved(worker.workDirs);
+});
+
+
+for (const format of ["jfif.jpg", "exif.jpg"]) {
+  for (const [orientation, width, height] of [["landscape", 1920, 1080], ["portrait", 1080, 1920]]) {
+    test(`${format} keeps its full four seconds before a five-second outro in ${orientation}`, { timeout: 60000 }, async () => {
+      // This realistic JPEG selects image2 in FFmpeg5, unlike the earlier
+      // FFmpeg-generated jpeg_pipe fixture. The former generic loop rendered
+      // only one black fade-in frame and silently lost the whole photo slot.
+      assert.equal(probe(fixtures[format]).format.format_name, "image2");
+      const worker = loadWorker({ inputFiles: {
+        "https://unit-test.invalid/photo": { file: fixtures[format], type: "image/jpeg" },
+        "https://unit-test.invalid/outro": { file: fixtures.png, type: "image/png" },
+      } });
+      queueJob(worker, "photo-duration", [
+        { url: "https://unit-test.invalid/photo", type: "image", duration: 4 },
+        { url: "https://unit-test.invalid/outro", type: "image", duration: 5 },
+      ], { width, height, fps: 30, durationPerPhoto: 4 });
+      worker.processQueue();
+      await waitForIdle(worker);
+      assert.equal(worker.jobs.get("photo-duration").status, "complete", worker.jobs.get("photo-duration").error);
+      assert.equal(worker.uploads.length, 1);
+      const output = path.join(dir, `complete-${format}-${orientation}.mp4`);
+      await fs.writeFile(output, worker.uploads[0].bytes);
+      assertVideo(output, 9, true, { width, height });
+      const stream = probe(output).streams.find((item) => item.codec_type === "video");
+      assert.equal(Number(stream.nb_frames), 270, "both photo and outro frames must survive joining");
+      for (const time of [1, 3, 4.5, 8]) {
+        const result = spawnSync("ffmpeg", ["-v", "error", "-ss", String(time), "-i", output, "-frames:v", "1", "-vf", "scale=1:1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"], { timeout: 10000 });
+        assert.equal(result.status, 0, result.stderr.toString());
+        const [red, , blue] = result.stdout;
+        if (time < 4) assert.ok(blue > 40, `actual pale test photo must be visible at ${time}s, got ${[...result.stdout]}`);
+        else assert.ok(red > blue + 50 && blue < 30, `red outro must begin after the photo at ${time}s, got ${[...result.stdout]}`);
+      }
+      await assertRemoved(worker.workDirs);
+    });
+  }
+}
+
+
+test("a successful but truncated image encode fails before film upload", { timeout: 15000 }, async () => {
+  const worker = loadWorker({
+    inputFiles: { "https://unit-test.invalid/photo": { file: fixtures["jfif.jpg"], type: "image/jpeg" } },
+    processSpawn: (command, args, opts) => {
+      const altered = [...args];
+      if (command === "ffmpeg" && altered.includes("libx264")) altered[altered.indexOf("-t") + 1] = "0.034";
+      return spawn(command, altered, opts);
+    },
+  });
+  queueJob(worker, "truncated", [{ url: "https://unit-test.invalid/photo", type: "image", duration: 4 }]);
+  worker.processQueue();
+  await waitForIdle(worker);
+  assert.equal(worker.jobs.get("truncated").status, "failed");
+  assert.match(worker.jobs.get("truncated").error, /Cannot render image 1 of 1.*duration mismatch.*expected 4s/s);
+  assert.equal(worker.uploads.length, 0);
   await assertRemoved(worker.workDirs);
 });

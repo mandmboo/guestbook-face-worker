@@ -116,8 +116,9 @@ The worker will create the bucket if the Supabase service role allows it.
 GIFs are treated as animated photos: all frames retain their timing and repeat
 for the requested photo duration, even if the original GIF does not loop. Still
 JPEG, PNG and WebP photos continue to fill the same finite photo slot. The
-renderer uses FFmpeg's generic `-stream_loop -1` for still images and an output
-`-t` limit rather than the image2-only `-loop` option. GIFs are identified by
+renderer preserves image2's `-loop 1` for still images and an output `-t`
+limit. Generic `-stream_loop` does not reliably repeat image2-demuxed JFIF/EXIF
+JPEGs on FFmpeg 5.1 and must not be used for this path. GIFs are identified by
 signature, not their extension. FFmpeg 5.1 silently freezes GIFs with generic
 stream looping, so the worker remuxes one pass with `-c:v copy -loop 0` and then
 uses the GIF demuxer's native `-ignore_loop 0`. This changes only loop metadata,
@@ -144,3 +145,16 @@ media nor prove live Storage authorization. CI also runs the render regressions
 inside `Dockerfile.video` with networking disabled, using the same Debian
 Bookworm FFmpeg family as production. A separately approved deployment and
 controlled live render are still required before claiming production recovery.
+
+
+The still-image regression also uses a 640x360 synthetic JFIF technical test card
+and a copy with EXIF orientation 6. These select FFmpeg's `image2` demuxer,
+whereas FFmpeg-generated JPEG fixtures often select `jpeg_pipe`. Both must show
+four full seconds of photo plus five seconds of outro (270 frames at 30 fps) in
+1920x1080 and 1080x1920 output, with visible-photo checks before the outro. This
+prevents a successful upload from hiding a one-frame/truncated still segment.
+
+Each image segment is also duration-checked with a bounded ffprobe before
+joining. An encoder success that is shorter or longer than its requested slot
+(by more than one frame plus 10ms) fails the job before any film upload instead
+of silently omitting a photo. This guard does not change video-clip handling.
