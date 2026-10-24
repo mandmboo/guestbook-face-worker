@@ -12,6 +12,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Use supported Node version
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run credential and startup regressions
+        run: node --test tests/supabaseServerKey.test.js
       - name: Validate worker syntax
         run: |
           node --check worker.js
@@ -30,6 +36,11 @@ jobs:
           docker run --rm --entrypoint node memory-lane-face-worker:test --check worker.js
       - name: Build the Railway video worker image
         run: docker build -f Dockerfile.video --tag memory-lane-video-worker:test .
+      - name: Run media and cleanup regressions with production FFmpeg
+        run: |
+          docker run --rm --network none --entrypoint node \
+            --mount type=bind,source="${{ github.workspace }}/tests",target=/app/tests,readonly \
+            memory-lane-video-worker:test --test tests/videoRender.test.js
       - name: Verify Voice audio processing in the video worker
         run: |
           docker inspect --format='{{json .Config.Cmd}}' memory-lane-video-worker:test | grep -q 'video-render-worker.js'
