@@ -1,18 +1,18 @@
 import * as faceapi from "face-api.js";
 import { Canvas, Image, ImageData, loadImage } from "canvas";
 import { createClient } from "@supabase/supabase-js";
+import { getSupabaseServerKey } from "./supabase-server-key.js";
 import sharp from "sharp";
 
 faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_SERVER_KEY = getSupabaseServerKey();
 const MODEL_URL = process.env.MODEL_URL || "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model";
 
 if (!SUPABASE_URL) throw new Error("SUPABASE_URL is required");
-if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error("SUPABASE_SERVICE_ROLE_KEY is required");
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVER_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
