@@ -68,7 +68,7 @@ function loadWorker({ processSpawn = spawn, runTimeout, inputFiles = {} } = {}) 
     fs: { ...fs, mkdtemp: async (prefix) => { const result = await fs.mkdtemp(prefix); workDirs.push(result); return result; } },
     tmpdir: () => dir,
     path, crypto, Buffer, URL, AbortController,
-    setTimeout: (callback, delay) => setTimeout(callback, runTimeout && delay >= 600000 ? runTimeout : delay),
+    setTimeout: (callback, delay) => setTimeout(callback, runTimeout && delay >= 30000 ? runTimeout : delay),
     clearTimeout,
     console: { log() {}, warn() {}, error() {} },
     fetch: async (url) => {
@@ -108,12 +108,22 @@ before(async () => {
     assert.equal(result.status, 0, `${binary} is required; run in Dockerfile.video or install FFmpeg`);
   }
   dir = await fs.mkdtemp(path.join(tmpdir(), "video-render-regressions-"));
-  fixtures = Object.fromEntries(["jpg", "png", "webp", "gif", "still.gif", "finite.gif", "mislabelled.jpg", "broken.png", "video.mp4", "audio.wav"].map((name) => [name, path.join(dir, `fixture.${name}`)]));
+  fixtures = Object.fromEntries(["jpg", "png", "webp", "gif", "still.gif", "finite.gif", "limited.gif", "variable.gif", "mislabelled.jpg", "broken.png", "video.mp4", "audio.wav"].map((name) => [name, path.join(dir, `fixture.${name}`)]));
   for (const ext of ["jpg", "png", "webp", "still.gif"]) {
     ffmpeg(["-f", "lavfi", "-i", "color=c=red:size=64x48", "-frames:v", "1", fixtures[ext]]);
   }
   ffmpeg(["-f", "lavfi", "-i", "color=c=red:size=64x48:rate=2:duration=0.5", "-f", "lavfi", "-i", "color=c=blue:size=64x48:rate=2:duration=0.5", "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0", "-loop", "0", fixtures.gif]);
   ffmpeg(["-i", fixtures.gif, "-loop", "-1", fixtures["finite.gif"]]);
+  ffmpeg(["-i", fixtures.gif, "-loop", "1", fixtures["limited.gif"]]);
+  const variable = await fs.readFile(fixtures.gif);
+  let controlOffset = 0;
+  for (const delay of [30, 70]) {
+    controlOffset = variable.indexOf(Buffer.from([0x21, 0xf9, 0x04]), controlOffset);
+    assert.ok(controlOffset >= 0, "synthetic GIF has two frame-control extensions");
+    variable.writeUInt16LE(delay, controlOffset + 4);
+    controlOffset += 8;
+  }
+  await fs.writeFile(fixtures["variable.gif"], variable);
   await fs.copyFile(fixtures.gif, fixtures["mislabelled.jpg"]);
   const corrupt = await fs.readFile(fixtures.png);
   const idat = corrupt.indexOf(Buffer.from("IDAT"));
@@ -128,26 +138,29 @@ before(async () => {
 
 after(async () => { if (dir) await fs.rm(dir, { recursive: true, force: true }); });
 
-for (const format of ["jpg", "png", "webp", "still.gif", "gif", "finite.gif", "mislabelled.jpg"]) {
+for (const format of ["jpg", "png", "webp", "still.gif", "gif", "finite.gif", "limited.gif", "variable.gif", "mislabelled.jpg"]) {
   test(`real FFmpeg renders ${format} for the whole bounded photo slot`, { timeout: 15000 }, async () => {
     const worker = loadWorker();
     const output = path.join(dir, `${format}.mp4`);
     await worker.renderImageSegment(fixtures[format], output, options);
     assertVideo(output, options.duration);
+    await assert.rejects(fs.stat(`${output}.loop.gif`), { code: "ENOENT" });
   });
 }
 
-test("GIF animation survives and loops instead of silently freezing or dropping the photo", { timeout: 15000 }, async () => {
-  const worker = loadWorker();
-  const output = path.join(dir, "animated.mp4");
-  await worker.renderImageSegment(fixtures.gif, output, options);
-  for (const [time, expected] of [[0.1, "red"], [0.6, "blue"], [1.1, "red"], [1.6, "blue"]]) {
-    const result = spawnSync("ffmpeg", ["-v", "error", "-ss", String(time), "-i", output, "-frames:v", "1", "-vf", "scale=1:1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"], { timeout: 5000 });
-    assert.equal(result.status, 0, result.stderr.toString());
-    const [red, , blue] = result.stdout;
-    assert.ok(expected === "red" ? red > blue + 100 : blue > red + 100, `expected ${expected} at ${time}s, got ${[...result.stdout]}`);
-  }
-});
+for (const format of ["gif", "finite.gif", "limited.gif", "variable.gif", "mislabelled.jpg"]) {
+  test(`${format} animation survives with original frame delays and repeats`, { timeout: 15000 }, async () => {
+    const worker = loadWorker();
+    const output = path.join(dir, `animated-${format}.mp4`);
+    await worker.renderImageSegment(fixtures[format], output, options);
+    for (const [time, expected] of [[0.1, "red"], [0.4, format === "variable.gif" ? "blue" : "red"], [0.6, "blue"], [1.1, "red"], [1.4, format === "variable.gif" ? "blue" : "red"], [1.6, "blue"]]) {
+      const result = spawnSync("ffmpeg", ["-v", "error", "-ss", String(time), "-i", output, "-frames:v", "1", "-vf", "scale=1:1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"], { timeout: 5000 });
+      assert.equal(result.status, 0, result.stderr.toString());
+      const [red, , blue] = result.stdout;
+      assert.ok(expected === "red" ? red > blue + 100 : blue > red + 100, `expected ${expected} at ${time}s, got ${[...result.stdout]}`);
+    }
+  });
+}
 
 test("bad PNG fails fast with decoder details instead of waiting ten minutes", { timeout: 10000 }, async () => {
   const worker = loadWorker();
@@ -240,4 +253,74 @@ test("timed-out render leaves no upload or running child and removes its temp di
 test("missing executable rejects without a hanging timer", { timeout: 5000 }, async () => {
   const worker = loadWorker();
   await assert.rejects(worker.run("/this-executable-does-not-exist", []), { code: "ENOENT" });
+});
+
+test("GIF loop preparation preserves every decoded pixel and unequal frame delays", { timeout: 15000 }, async () => {
+  let remuxed;
+  const worker = loadWorker({ processSpawn: (command, args, opts) => {
+    if (command === "ffmpeg" && args.includes("-ignore_loop") && args[args.indexOf("-ignore_loop") + 1] === "0") {
+      remuxed = readFileSync(args[args.indexOf("-i") + 1]);
+    }
+    return spawn(command, args, opts);
+  } });
+  await worker.renderImageSegment(fixtures["variable.gif"], path.join(dir, "lossless.mp4"), options);
+  assert.ok(remuxed);
+  const copy = path.join(dir, "remuxed.gif");
+  await fs.writeFile(copy, remuxed);
+  const frames = (file) => {
+    const result = spawnSync("ffmpeg", ["-v", "error", "-ignore_loop", "1", "-i", file, "-f", "framemd5", "-"], { timeout: 5000, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.split("\n").filter((line) => line && !line.startsWith("#")).map((line) => line.split(",").at(-1).trim());
+  };
+  const delays = (file) => {
+    const result = spawnSync("ffprobe", ["-v", "error", "-show_entries", "packet=duration_time", "-of", "csv=p=0", file], { timeout: 5000, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  assert.deepEqual(frames(copy), frames(fixtures["variable.gif"]));
+  assert.equal(delays(copy), "0.300000\n0.700000");
+  assert.equal(delays(copy), delays(fixtures["variable.gif"]));
+});
+
+test("a GIF cycle longer than the photo slot is cut at the slot, not sped up", { timeout: 15000 }, async () => {
+  const bytes = await fs.readFile(fixtures["variable.gif"]);
+  const control = bytes.indexOf(Buffer.from([0x21, 0xf9, 0x04]));
+  bytes.writeUInt16LE(250, control + 4);
+  const longGif = path.join(dir, "long.gif");
+  await fs.writeFile(longGif, bytes);
+  const worker = loadWorker();
+  const output = path.join(dir, "long.mp4");
+  await worker.renderImageSegment(longGif, output, options);
+  assertVideo(output, options.duration);
+  const frames = spawnSync("ffmpeg", ["-v", "error", "-i", output, "-vf", "scale=1:1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"], { timeout: 5000 });
+  assert.equal(frames.status, 0, frames.stderr.toString());
+  assert.equal(frames.stdout.length, 27 * 3);
+  for (let offset = 0; offset < frames.stdout.length; offset += 3) {
+    assert.ok(frames.stdout[offset] > frames.stdout[offset + 2] + 100, "red first frame lasts longer than the entire requested slot");
+  }
+});
+
+test("GIF encoding failure removes the intermediate loop file", { timeout: 15000 }, async () => {
+  const output = path.join(dir, "gif-encode-failure.mp4");
+  const worker = loadWorker({ processSpawn: (command, args, opts) => {
+    if (args.includes("libx264")) return spawn(process.execPath, ["-e", "process.stderr.write('synthetic encoder failure'); process.exit(3)"], opts);
+    return spawn(command, args, opts);
+  } });
+  await assert.rejects(worker.renderImageSegment(fixtures.gif, output, options), /render image segment failed.*synthetic encoder failure/s);
+  await assert.rejects(fs.stat(`${output}.loop.gif`), { code: "ENOENT" });
+});
+
+test("GIF timing timeout is bounded, reaped and cleans up the job", { timeout: 5000 }, async () => {
+  const worker = loadWorker({
+    inputFiles: { "https://unit-test.invalid/gif": { file: fixtures.gif, type: "image/gif" } },
+    processSpawn: () => spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: ["ignore", "pipe", "pipe"] }),
+    runTimeout: 100,
+  });
+  queueJob(worker, "gif-timeout", [{ url: "https://unit-test.invalid/gif" }]);
+  worker.processQueue();
+  await waitForIdle(worker);
+  assert.match(worker.jobs.get("gif-timeout").error, /probe GIF timing timed out/);
+  assert.equal(worker.uploads.length, 0);
+  for (const child of worker.children) assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+  await assertRemoved(worker.workDirs);
 });

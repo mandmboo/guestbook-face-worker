@@ -275,29 +275,78 @@ function buildVideoFilter(width, height, fps, duration, fade = false) {
   return base.join(",");
 }
 
+async function isGifFile(inputPath) {
+  // Downloads may have the wrong extension or content type. Inspect the actual
+  // signature so an animated GIF named .jpg still gets the GIF demuxer path.
+  const file = await fs.open(inputPath, "r");
+  try {
+    const header = Buffer.alloc(6);
+    await file.read(header, 0, header.length, 0);
+    return ["GIF87a", "GIF89a"].includes(header.toString("ascii"));
+  } finally {
+    await file.close();
+  }
+}
+
 async function renderImageSegment(inputPath, outputPath, options) {
   const { width, height, fps, duration } = options;
   const filter = buildVideoFilter(width, height, fps, duration, true);
-  await run("ffmpeg", [
-    "-y",
-    "-hide_banner",
-    "-loglevel", "error",
-    "-xerror",
-    // Unlike image2's -loop, this works for GIFs as well as still images.
-    // GIF frames keep their timing and repeat to fill the photo slot.
-    "-stream_loop", "-1",
-    "-i", inputPath,
-    // An output limit also bounds repeated/animated input streams.
-    "-t", String(duration),
-    "-vf", filter,
-    "-an",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "21",
-    "-pix_fmt", "yuv420p",
-    "-movflags", "+faststart",
-    outputPath,
-  ], { label: "render image segment" });
+  let loopedGifPath;
+  try {
+    let sourcePath = inputPath;
+    let loopOptions = ["-stream_loop", "-1"];
+    if (await isGifFile(inputPath)) {
+      // FFmpeg 5.1's generic stream_loop can silently freeze GIF animation.
+      // Losslessly remux one pass with an infinite GIF loop extension,
+      // then use the GIF demuxer's native loop. This also handles finite GIFs
+      // and GIFs without loop metadata, without re-encoding their pixel data.
+      const timing = await run("ffprobe", [
+        "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=duration", "-of", "csv=p=0", inputPath,
+      ], { label: "probe GIF timing", timeoutMs: 30 * 1000 });
+      // GIF timestamps use hundredths of a second. run() retains the tail of
+      // stdout, so this reads the last frame even for GIFs with many packets.
+      const finalDelay = Number(timing.stdout.trim().split(/\r?\n/).pop());
+      if (!Number.isInteger(finalDelay) || finalDelay < 1 || finalDelay > 65535) {
+        throw new Error("Cannot read the GIF's final frame duration");
+      }
+      loopedGifPath = `${outputPath}.loop.gif`;
+      await run("ffmpeg", [
+        "-y", "-hide_banner", "-loglevel", "error", "-xerror",
+        "-ignore_loop", "1",
+        "-i", inputPath,
+        "-map", "0:v:0",
+        "-c:v", "copy",
+        "-loop", "0",
+        // The GIF muxer otherwise repeats the preceding frame's delay,
+        // which changes the cycle length for variable-duration animations.
+        "-final_delay", String(finalDelay),
+        loopedGifPath,
+      ], { label: "prepare animated GIF", timeoutMs: 60 * 1000 });
+      sourcePath = loopedGifPath;
+      loopOptions = ["-ignore_loop", "0"];
+    }
+    await run("ffmpeg", [
+      "-y",
+      "-hide_banner",
+      "-loglevel", "error",
+      "-xerror",
+      ...loopOptions,
+      "-i", sourcePath,
+      // An output limit also bounds repeated/animated input streams.
+      "-t", String(duration),
+      "-vf", filter,
+      "-an",
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-crf", "21",
+      "-pix_fmt", "yuv420p",
+      "-movflags", "+faststart",
+      outputPath,
+    ], { label: "render image segment" });
+  } finally {
+    if (loopedGifPath) await fs.rm(loopedGifPath, { force: true }).catch(() => null);
+  }
 }
 
 async function renderVideoSegment(inputPath, outputPath, options) {

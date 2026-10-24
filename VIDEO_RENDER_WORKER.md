@@ -116,9 +116,16 @@ The worker will create the bucket if the Supabase service role allows it.
 GIFs are treated as animated photos: all frames retain their timing and repeat
 for the requested photo duration, even if the original GIF does not loop. Still
 JPEG, PNG and WebP photos continue to fill the same finite photo slot. The
-renderer uses FFmpeg's generic `-stream_loop -1` input option and an output `-t`
-limit rather than the image2-only `-loop` option. No customer media is silently
-skipped or converted to a poster frame.
+renderer uses FFmpeg's generic `-stream_loop -1` for still images and an output
+`-t` limit rather than the image2-only `-loop` option. GIFs are identified by
+signature, not their extension. FFmpeg 5.1 silently freezes GIFs with generic
+stream looping, so the worker remuxes one pass with `-c:v copy -loop 0` and then
+uses the GIF demuxer's native `-ignore_loop 0`. This changes only loop metadata,
+not compressed pixels. A timing probe preserves the last frame's actual delay
+with `-final_delay` (the muxer's default otherwise repeats the preceding delay).
+The probe and remux have 30-second and 60-second timeouts; the temporary GIF is
+removed on success or failure. No customer media is silently skipped or
+converted to a poster frame.
 
 Image decoder errors stop immediately (`-xerror`), rather than repeatedly trying
 a corrupt frame until the ten-minute process timeout. The job error identifies
@@ -128,9 +135,11 @@ the temporary directory is removed and the next queued job can run. Timeouts
 cleanup. This does not add a public job-cancellation endpoint.
 
 `npm test` now requires `ffmpeg` and `ffprobe` and tests real synthetic JPEG, PNG,
-WebP, static/animated GIF, a mislabelled GIF, video, corrupt PNG, film assembly,
-silent/music audio, queue recovery, subprocess timeouts/cancellation and temp
-cleanup. HTTP and Storage are stubbed, so these tests neither access customers'
+WebP, static/animated/finite/variable-delay GIFs, a mislabelled GIF, video,
+corrupt PNG, film assembly, silent/music audio, queue recovery, subprocess
+timeouts/cancellation and temp cleanup. Pixel hashes and frame timings verify
+that the GIF remux is lossless, and long GIF cycles remain bounded by the photo
+slot rather than being sped up. HTTP and Storage are stubbed, so these tests neither access customers'
 media nor prove live Storage authorization. CI also runs the render regressions
 inside `Dockerfile.video` with networking disabled, using the same Debian
 Bookworm FFmpeg family as production. A separately approved deployment and
