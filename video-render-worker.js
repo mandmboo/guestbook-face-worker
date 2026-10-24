@@ -138,16 +138,31 @@ function inferMediaType(item, contentType = "") {
 async function run(command, args, options = {}) {
   const label = options.label || command;
   const timeoutMs = options.timeoutMs || 10 * 60 * 1000;
+  const signal = options.signal;
+  if (signal?.aborted) throw new Error(`${label} cancelled`);
   console.log(`[VideoRender] ${label}: ${command} ${args.join(" ")}`);
 
   return await new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => {
+    let stoppedError;
+    // Do not release the job slot or remove its files until the child has
+    // actually closed. Killing and immediately rejecting races job cleanup.
+    const stop = (error) => {
+      if (stoppedError) return;
+      stoppedError = error;
       child.kill("SIGKILL");
-      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    };
+    const timer = setTimeout(() => {
+      stop(new Error(`${label} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
+    const abort = () => stop(new Error(`${label} cancelled`));
+    signal?.addEventListener("abort", abort, { once: true });
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+    };
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
@@ -158,12 +173,14 @@ async function run(command, args, options = {}) {
       stderr = stderr.slice(-20000);
     });
     child.on("error", (error) => {
-      clearTimeout(timer);
+      cleanup();
       reject(error);
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) {
+      cleanup();
+      if (stoppedError) {
+        reject(stoppedError);
+      } else if (code === 0) {
         resolve({ stdout, stderr });
       } else {
         reject(new Error(`${label} failed with code ${code}: ${stderr || stdout}`));
@@ -258,23 +275,78 @@ function buildVideoFilter(width, height, fps, duration, fade = false) {
   return base.join(",");
 }
 
+async function isGifFile(inputPath) {
+  // Downloads may have the wrong extension or content type. Inspect the actual
+  // signature so an animated GIF named .jpg still gets the GIF demuxer path.
+  const file = await fs.open(inputPath, "r");
+  try {
+    const header = Buffer.alloc(6);
+    await file.read(header, 0, header.length, 0);
+    return ["GIF87a", "GIF89a"].includes(header.toString("ascii"));
+  } finally {
+    await file.close();
+  }
+}
+
 async function renderImageSegment(inputPath, outputPath, options) {
   const { width, height, fps, duration } = options;
   const filter = buildVideoFilter(width, height, fps, duration, true);
-  await run("ffmpeg", [
-    "-y",
-    "-loop", "1",
-    "-t", String(duration),
-    "-i", inputPath,
-    "-vf", filter,
-    "-an",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "21",
-    "-pix_fmt", "yuv420p",
-    "-movflags", "+faststart",
-    outputPath,
-  ], { label: "render image segment" });
+  let loopedGifPath;
+  try {
+    let sourcePath = inputPath;
+    let loopOptions = ["-stream_loop", "-1"];
+    if (await isGifFile(inputPath)) {
+      // FFmpeg 5.1's generic stream_loop can silently freeze GIF animation.
+      // Losslessly remux one pass with an infinite GIF loop extension,
+      // then use the GIF demuxer's native loop. This also handles finite GIFs
+      // and GIFs without loop metadata, without re-encoding their pixel data.
+      const timing = await run("ffprobe", [
+        "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=duration", "-of", "csv=p=0", inputPath,
+      ], { label: "probe GIF timing", timeoutMs: 30 * 1000 });
+      // GIF timestamps use hundredths of a second. run() retains the tail of
+      // stdout, so this reads the last frame even for GIFs with many packets.
+      const finalDelay = Number(timing.stdout.trim().split(/\r?\n/).pop());
+      if (!Number.isInteger(finalDelay) || finalDelay < 1 || finalDelay > 65535) {
+        throw new Error("Cannot read the GIF's final frame duration");
+      }
+      loopedGifPath = `${outputPath}.loop.gif`;
+      await run("ffmpeg", [
+        "-y", "-hide_banner", "-loglevel", "error", "-xerror",
+        "-ignore_loop", "1",
+        "-i", inputPath,
+        "-map", "0:v:0",
+        "-c:v", "copy",
+        "-loop", "0",
+        // The GIF muxer otherwise repeats the preceding frame's delay,
+        // which changes the cycle length for variable-duration animations.
+        "-final_delay", String(finalDelay),
+        loopedGifPath,
+      ], { label: "prepare animated GIF", timeoutMs: 60 * 1000 });
+      sourcePath = loopedGifPath;
+      loopOptions = ["-ignore_loop", "0"];
+    }
+    await run("ffmpeg", [
+      "-y",
+      "-hide_banner",
+      "-loglevel", "error",
+      "-xerror",
+      ...loopOptions,
+      "-i", sourcePath,
+      // An output limit also bounds repeated/animated input streams.
+      "-t", String(duration),
+      "-vf", filter,
+      "-an",
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-crf", "21",
+      "-pix_fmt", "yuv420p",
+      "-movflags", "+faststart",
+      outputPath,
+    ], { label: "render image segment" });
+  } finally {
+    if (loopedGifPath) await fs.rm(loopedGifPath, { force: true }).catch(() => null);
+  }
 }
 
 async function renderVideoSegment(inputPath, outputPath, options) {
@@ -530,10 +602,17 @@ async function renderJob(jobId) {
         ? normaliseNumber(item.duration || item.clipDuration || maxVideoDuration, maxVideoDuration, 1, 120)
         : normaliseNumber(item.duration || defaultPhotoDuration, defaultPhotoDuration, 1, 20);
 
-      if (mediaType === "video") {
-        await renderVideoSegment(inputPath, segmentPath, { width, height, fps, duration });
-      } else {
-        await renderImageSegment(inputPath, segmentPath, { width, height, fps, duration });
+      try {
+        if (mediaType === "video") {
+          await renderVideoSegment(inputPath, segmentPath, { width, height, fps, duration });
+        } else {
+          await renderImageSegment(inputPath, segmentPath, { width, height, fps, duration });
+        }
+      } catch (error) {
+        throw new Error(
+          `Cannot render ${mediaType} ${index + 1} of ${media.length}. `
+          + `Check or replace this media file; no film was uploaded. ${safeMessage(error)}`
+        );
       }
 
       segmentPaths.push(segmentPath);
