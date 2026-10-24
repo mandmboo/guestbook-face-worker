@@ -34,12 +34,32 @@ Do not change the existing Face ID Railway service start command.
 ```text
 RENDER_SECRET=make-a-long-random-secret
 SUPABASE_URL=your-supabase-url
-SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+SUPABASE_SECRET_KEY=your-server-only-supabase-secret-key
 RENDER_OUTPUT_BUCKET=rendered-films
 MAX_CONCURRENT_RENDERS=1
 ```
 
 `RENDER_SECRET` must match the value used in Vercel as `MEMORY_FILM_RENDER_SECRET`.
+
+Both workers support `SUPABASE_SECRET_KEY`, but keep preferring the existing
+`SUPABASE_SERVICE_ROLE_KEY` while `MEMORY_LANE_CREDENTIAL_MODE` is unset or
+`legacy-compatible`. This lets a replacement key be staged without activating
+it. After separate approval, `secret-compatible` prefers the new key while
+retaining the legacy fallback. A publishable key,
+anon/user JWT, or missing privileged credential stops startup; the renderer no
+longer advertises a healthy process that cannot upload its results.
+
+After a separately approved migration has installed and tested a new secret key
+for each worker, set `MEMORY_LANE_CREDENTIAL_MODE=strict`. Strict mode requires
+`SUPABASE_SECRET_KEY` containing a modern secret key and never falls back to a
+legacy key. Invalid modes fail startup. This is configuration preparation only:
+it does not rotate, revoke, or disable any Supabase key. Do not disable legacy
+keys until every consumer (including the Vercel app and Edge Functions) has been
+migrated and verified. Keep the already-rotated render secret unchanged.
+
+Run the local credential/startup regression tests with `npm test`. These tests
+stub Supabase rather than contacting production; a deployment and real worker
+smoke test still require separate approval.
 
 ## Endpoints
 

@@ -5,11 +5,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { createClient } from "@supabase/supabase-js";
+import { getSupabaseServerKey } from "./supabase-server-key.js";
 
 const PORT = Number(process.env.PORT || 3000);
 const RENDER_SECRET = process.env.RENDER_SECRET || process.env.MEMORY_FILM_RENDER_SECRET || "";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const SUPABASE_SERVER_KEY = getSupabaseServerKey();
 const OUTPUT_BUCKET = process.env.RENDER_OUTPUT_BUCKET || "rendered-films";
 const VOICE_OUTPUT_BUCKET = process.env.VOICE_OUTPUT_BUCKET || "guest-uploads";
 const MAX_MEDIA_ITEMS = Number(process.env.MAX_RENDER_MEDIA_ITEMS || 120);
@@ -22,13 +23,11 @@ if (!RENDER_SECRET) {
   console.warn("[VideoRender] RENDER_SECRET is not set. Render endpoints will reject requests.");
 }
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn("[VideoRender] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing. Uploads will fail until configured.");
-}
+if (!SUPABASE_URL) throw new Error("SUPABASE_URL is required");
 
-const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-  : null;
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVER_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
 
 const jobs = new Map();
 const queue = [];

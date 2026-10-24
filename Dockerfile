@@ -23,6 +23,7 @@ ENV PYTHON=/usr/bin/python3
 RUN npm install --omit=dev --no-audit --no-fund
 
 COPY worker.js ./worker.js
+COPY supabase-server-key.js ./supabase-server-key.js
 
 ENV NODE_ENV=production
 

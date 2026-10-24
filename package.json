@@ -4,7 +4,8 @@
   "type": "module",
   "main": "worker.js",
   "scripts": {
-    "start": "node worker-entry.js"
+    "start": "node worker-entry.js",
+    "test": "node --test tests/*.test.js"
   },
   "engines": {
     "node": "22.x"
