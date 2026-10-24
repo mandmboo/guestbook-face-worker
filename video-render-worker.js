@@ -294,7 +294,9 @@ async function renderImageSegment(inputPath, outputPath, options) {
   let loopedGifPath;
   try {
     let sourcePath = inputPath;
-    let loopOptions = ["-stream_loop", "-1"];
+    // Preserve image2's still-image loop: generic stream_loop does not
+    // repeat image2-demuxed JFIF/EXIF JPEGs on FFmpeg 5.1.
+    let loopOptions = ["-loop", "1"];
     if (await isGifFile(inputPath)) {
       // FFmpeg 5.1's generic stream_loop can silently freeze GIF animation.
       // Losslessly remux one pass with an infinite GIF loop extension,
@@ -344,6 +346,16 @@ async function renderImageSegment(inputPath, outputPath, options) {
       "-movflags", "+faststart",
       outputPath,
     ], { label: "render image segment" });
+    const result = await run("ffprobe", [
+      "-v", "error", "-select_streams", "v:0",
+      "-show_entries", "stream=duration", "-of", "csv=p=0", outputPath,
+    ], { label: "verify image duration", timeoutMs: 30 * 1000 });
+    const renderedDuration = Number(result.stdout.trim());
+    // A successful encoder exit is not enough: a non-looping still can yield
+    // one black fade-in frame. Never silently upload a film missing its photo.
+    if (!Number.isFinite(renderedDuration) || Math.abs(renderedDuration - duration) > 1 / fps + 0.01) {
+      throw new Error(`Image segment duration mismatch (${result.stdout.trim() || "unknown"}s; expected ${duration}s)`);
+    }
   } finally {
     if (loopedGifPath) await fs.rm(loopedGifPath, { force: true }).catch(() => null);
   }
